@@ -158,5 +158,52 @@ class GPT(nn.Module):
         return model
 
 # ----------------
-model=GPT.from_pretrained('gpt2')
+prompt="Hello, I'm a language model,"
+num_repeat_sequences=5
+max_length=30
+
+#autodetection for device
+device="cpu"
+if torch.cuda.is_available():
+    device="cuda"
+elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+    device="mps" 
+
+print("Using device:", device)
+
+#model=GPT.from_pretrained('gpt2')
+model=GPT(GPTConfig())
 print("Model Weights Load Done")
+
+model.eval() #turns it into eval mode, which is good practice apparently
+model.to(device)
+
+import tiktoken
+enc=tiktoken.get_encoding('gpt2')
+tokens=enc.encode(prompt)
+tokens=torch.tensor(tokens, dtype=torch.long)
+tokens=tokens.unsqueeze(0).repeat(num_repeat_sequences, 1) #[5,8] #unsqueeze here adds a new dimension at pos 0, repeat replicates the same sequece 5 times
+x=tokens.to(device)
+torch.manual_seed(42)
+
+"""
+This whole part is still kind of confusing to me
+"""
+
+while x.size(1)<max_length: #this loop starts when inputting a sequence of tokens, with whatever is input, whole ass transformer will look back and predict next token
+    with torch.no_grad():
+        #take note that x is in shape [B,T] right now
+        logits, loss=model(x)  #after running through the model [B,T,vocab_size], for each token, we have the logits for the entire vocab, and this logit represents the confidence for this token to be the next token
+        logits=logits[:, -1, :] #we zoom in on the logits for the last token, now logits shape is [B, vocab_size]
+        probs=F.softmax(logits, dim=-1) 
+        topk_probs, topk_indices=torch.topk(probs, k=50, dim=-1) #shape [B, k] which is the number of batches and the top k tokens, and their probabilities
+        ix=torch.multinomial(topk_probs, 1) #next selected index will be random based on the top 50 probabilities
+        xcol=torch.gather(topk_indices, 1, ix) #match the token that is selected
+        x=torch.cat((x,xcol), dim=1) #concats the x tokens with the newest one
+
+
+for i in range(num_repeat_sequences): #this part just prints all of the different repeat sequences, if k=1, all sequences will be the same
+    tokens=x[i, :max_length].tolist()
+    decoded=enc.decode(tokens)
+    print(">", decoded)
+
