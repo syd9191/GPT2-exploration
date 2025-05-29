@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 import torch 
+import tiktoken
 import torch.nn as nn
 from torch.nn import functional as F
 
@@ -11,6 +12,33 @@ class GPTConfig:
     n_layer:int=12
     n_head:int=12
     n_embd:int=768
+
+class DataLoaderLite():
+    def __init__(self, B, T, device):
+        self.device=device
+        self.B=B
+        self.T=T
+        with open('./exploration/input.txt', 'r') as f:
+            text=f.read()
+        enc=tiktoken.get_encoding('gpt2')
+        tokens=enc.encode(text)
+        self.tokens=torch.tensor(tokens)
+        print(f"Loaded {len(self.tokens)} Tokens")
+        print(f"1 Epoch = {len(self.tokens)//(B*T)} Batches")
+        self.current_pos=0
+
+    def get_next_batch(self):
+        B=self.B
+        T=self.T
+        buf=self.tokens[self.current_pos: self.current_pos+(B*T)+1] #similar batching that we tested
+        x=buf[:-1].view(B, T).to(self.device) #should follow a B batches of T sequences kind of format
+        y=buf[1:].view(B, T).to(self.device)
+        self.current_pos+=B*T
+        if self.current_pos + (B*T+1)>len(self.tokens): #we have already reached the end of our training dataset
+            self.currnet_pos=0
+        return x, y
+        
+    
 
 
 class CausalSelfAttention(nn.Module):
@@ -162,6 +190,7 @@ if __name__=="__main__":
     prompt="Hello, I'm a language model,"
     num_repeat_sequences=5
     max_length=30
+    B, T= 4, 32
 
     #autodetection for device
     device="cpu"
@@ -172,6 +201,9 @@ if __name__=="__main__":
 
     print("Using device:", device)
 
+    train_loader=DataLoaderLite(B, T, device)
+
+
     #model=GPT.from_pretrained('gpt2')
     model=GPT(GPTConfig())
     print("Model Weights Load Done")
@@ -179,6 +211,20 @@ if __name__=="__main__":
     model.eval() #turns it into eval mode, which is good practice apparently
     model.to(device)
 
+    #small batch overfitting
+    optimiser=torch.optim.AdamW(model.parameters(), lr=3e-4) #model.parameters() comes from nn.module which all our layers are inherited from
+
+    for i in range(10000):
+        x, y= train_loader.get_next_batch()
+        optimiser.zero_grad() #we are not doing gradient accumulation, so no need to keep gradients, this is not the same as zeroing the weights take note
+        logits,loss=model(x, y)
+        loss.backward() #loss backwards is surprisingly not just a number but a graph that pytorch builds. Starts with a scalar at the end and traverses it backwards, using chainrule to work out gradient at every stage
+        optimiser.step() #optimiser step is the weight update, e.g weight=weight-lr*gradient (for adamW add your first moment second moment)
+        print(f'step:{i},  loss:{loss.item()}')
+
+    import  sys;sys.exit(0)
+
+    """
     import tiktoken
     enc=tiktoken.get_encoding('gpt2')
     tokens=enc.encode(prompt)
@@ -186,6 +232,8 @@ if __name__=="__main__":
     tokens=tokens.unsqueeze(0).repeat(num_repeat_sequences, 1) #[5,8] #unsqueeze here adds a new dimension at pos 0, repeat replicates the same sequece 5 times
     x=tokens.to(device)
     torch.manual_seed(42)
+    """
+    
 
     """
     This whole part is still kind of confusing to me
