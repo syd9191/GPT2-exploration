@@ -34,8 +34,8 @@ class DataLoaderLite():
         x=buf[:-1].view(B, T).to(self.device) #should follow a B batches of T sequences kind of format
         y=buf[1:].view(B, T).to(self.device)
         self.current_pos+=B*T
-        if self.current_pos + (B*T+1)>len(self.tokens): #we have already reached the end of our training dataset
-            self.currnet_pos=0
+        if self.current_pos + (B*T+1)>=len(self.tokens): #we have already reached the end of our training dataset
+            self.current_pos=0
         return x, y
         
     
@@ -48,7 +48,7 @@ class CausalSelfAttention(nn.Module):
         self.c_attn=nn.Linear(config.n_embd, 3*config.n_embd) #for the k,q,v
 
         self.c_proj=nn.Linear(config.n_embd, config.n_embd) 
-        self.c_proj.NANOGPT_SCALE_INIT = 1
+        self.c_proj.NANOGPT_SCALE_INIT = 1 #this is a flag for scaling down weights, following xaviers initialisation
         self.n_head=config.n_head
         self.n_embd=config.n_embd
 
@@ -85,6 +85,7 @@ class MLP(nn.Module):
         self.c_fc=nn.Linear(config.n_embd, 4*config.n_embd)
         self.gelu=nn.GELU(approximate='tanh') #GELU: Gausian Error Linear Unit, is what they came up with to deal with the dead neuron problem that comes with RELU, read more here: http://arxiv.org/pdf/1606.08415v5
         self.c_proj=nn.Linear(4*config.n_embd, config.n_embd)
+        self.c_proj.NANOGPT_SCALE_INIT = 1
 
     def forward(self, x):
         x=self.c_fc(x) ##pass through the fully connect
@@ -116,6 +117,23 @@ class GPT(nn.Module):
             ln_f=nn.LayerNorm(config.n_embd), #layer norm
         ))
         self.lm_head=nn.Linear(config.n_embd, config.vocab_size, bias=False)
+
+        #weight sharing: This concept is expanded on the google docs: https://docs.google.com/document/d/1cRYtDPcxogKBLilWpaeLZIxQlXp04IAZwKnCuk3GhUU/edit?tab=t.0
+        self.transformer.wte.weight=self.lm_head.weight
+
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            std=0.02
+            if hasattr(module, 'NANOGPT_SCALE_INIT'):
+                std*= (2*self.config.n_layer)**-0.5 #2 cause there are two residual connections for each block i guess
+            torch.nn.init.normal_(module.weight, mean=0, std=0.02) 
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0, std=0.02) #same as above
+    
     
     def forward(self, idx, targets=None):
         B, T=idx.size() #Batch , Sequence length
@@ -199,6 +217,8 @@ if __name__=="__main__":
     elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
         device="mps" 
 
+    torch.manual_seed(42)
+    
     print("Using device:", device)
 
     train_loader=DataLoaderLite(B, T, device)
@@ -225,6 +245,7 @@ if __name__=="__main__":
     import  sys;sys.exit(0)
 
     """
+    #use this code if we wanna hack generation loop
     import tiktoken
     enc=tiktoken.get_encoding('gpt2')
     tokens=enc.encode(prompt)
@@ -232,12 +253,7 @@ if __name__=="__main__":
     tokens=tokens.unsqueeze(0).repeat(num_repeat_sequences, 1) #[5,8] #unsqueeze here adds a new dimension at pos 0, repeat replicates the same sequece 5 times
     x=tokens.to(device)
     torch.manual_seed(42)
-    """
-    
-
-    """
-    This whole part is still kind of confusing to me
-    """
+   
 
     while x.size(1)<max_length: #this loop starts when inputting a sequence of tokens, with whatever is input, whole ass transformer will look back and predict next token
         with torch.no_grad():
@@ -255,4 +271,6 @@ if __name__=="__main__":
         tokens=x[i, :max_length].tolist()
         decoded=enc.decode(tokens)
         print(">", decoded)
+
+    """
 
