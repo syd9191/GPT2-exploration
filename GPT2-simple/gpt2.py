@@ -1,8 +1,12 @@
+import os, random
+from pathlib import Path
 from dataclasses import dataclass
-import torch 
-import tiktoken
+
+import torch
 import torch.nn as nn
-from torch.nn import functional as F
+import torch.nn.functional as F
+from torch.utils.data import IterableDataset, DataLoader, DistributedSampler
+import tiktoken
 
 #---------------------------------------------------------
 @dataclass
@@ -13,12 +17,53 @@ class GPTConfig:
     n_head:int=12
     n_embd:int=768
 
+class TokenTextDataset(IterableDataset):
+    """
+    Streams the entire file token-by-token forever, returning sa contiguous
+    sliding window of `block_size` for x and the next-token labels for y.
+    """
+
+    def __init__(self, path: str | os.PathLike, block_size: int):
+        path = Path(path)
+        if not path.exists():
+            raise FileNotFoundError(path)
+
+        text      = path.read_text(encoding="utf-8")
+        enc       = tiktoken.get_encoding("gpt2")
+        self.tokens = torch.tensor(enc.encode(text), dtype=torch.long)
+        self.block_size = block_size
+
+        # introduce per-worker offset to avoid every worker seeing the
+        # same sequence order when shuffling is disallowed.
+        # DataLoader(worker_init_fn) will set this value.
+        self._worker_offset = 0
+
+    # DataLoader with an IterableDataset must NOT shuffle. We instead start each worker at a random offset to approximate randomness.
+    def set_worker_offset(self, offset: int):
+        self._worker_offset = offset
+
+    def __iter__(self):
+        n   = len(self.tokens)
+        pos = self._worker_offset % n
+        rng = torch.Generator().manual_seed(torch.randint(0, 2**31 - 1, (1,)).item())
+
+        while True:
+            # wrap & optionally jump to a new random start to decorrelate batches
+            if pos + self.block_size + 1 >= n:
+                pos = torch.randint(0, n - self.block_size - 2, (1,), generator=rng).item()
+
+            chunk  = self.tokens[pos : pos + self.block_size + 1]           # (T+1,)
+            x      = chunk[:-1]                                             # (T,)
+            y      = chunk[ 1:]                                             # (T,)
+            pos   += self.block_size
+            yield x, y                                                      # DataLoader → (B,T)
+
 class DataLoaderLite():
     def __init__(self, B, T, device):
         self.device=device
         self.B=B
         self.T=T
-        with open('./exploration/input.txt', 'r') as f:
+        with open('../exploration/input.txt', 'r') as f:
             text=f.read()
         enc=tiktoken.get_encoding('gpt2')
         tokens=enc.encode(text)
@@ -38,7 +83,6 @@ class DataLoaderLite():
             self.current_pos=0
         return x, y
         
-    
 
 
 class CausalSelfAttention(nn.Module):
@@ -68,9 +112,9 @@ class CausalSelfAttention(nn.Module):
 
         #here we split each KQV tensor into number of heads for simulatneous processing, we force a new tensor shape while keeping the same data so we can calc attention down the road
     
-        k=k.view(B,T,self.n_head,C//self.n_head).transpose(1,2) #final output dimension [B,n_head,T,hs]
-        q=q.view(B,T,self.n_head,C//self.n_head).transpose(1,2) #final output dimension [B,n_head,T,hs]
-        v=v.view(B,T,self.n_head,C//self.n_head).transpose(1,2) #final output dimension [B,n_head,T,hs]
+        k=k.contiguous().view(B,T,self.n_head,C//self.n_head).transpose(1,2) #final output dimension [B,n_head,T,hs]
+        q=q.contiguous().view(B,T,self.n_head,C//self.n_head).transpose(1,2) #final output dimension [B,n_head,T,hs]
+        v=v.contiguous().view(B,T,self.n_head,C//self.n_head).transpose(1,2) #final output dimension [B,n_head,T,hs]
 
         y=F.scaled_dot_product_attention(q,k,v, is_causal=True) #normal dot prod calculation of attention, this one might use flash_attn not very sure
         y=y.transpose(1,2).contiguous().view(B,T,C) #reassembles the heads back to the original dimensions
@@ -128,11 +172,11 @@ class GPT(nn.Module):
             std=0.02
             if hasattr(module, 'NANOGPT_SCALE_INIT'):
                 std*= (2*self.config.n_layer)**-0.5 #2 cause there are two residual connections for each block i guess
-            torch.nn.init.normal_(module.weight, mean=0, std=0.02) 
+            torch.nn.init.normal_(module.weight, mean=0, std=std)
             if module.bias is not None:
                 torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
-            torch.nn.init.normal_(module.weight, mean=0, std=0.02) #same as above
+            torch.nn.init.normal_(module.weight, mean=0, std=0.02)
     
     
     def forward(self, idx, targets=None):
@@ -203,45 +247,145 @@ class GPT(nn.Module):
 
         return model
 
+def make_loader(dataset: TokenTextDataset, batch_size: int, num_workers: int,
+                sampler: DistributedSampler | None, device_is_cuda: bool):
+    def worker_init_fn(worker_id: int):
+        worker_info = torch.utils.data.get_worker_info()
+        dataset: TokenTextDataset = worker_info.dataset
+        offset = random.randint(0, len(dataset.tokens) - 1)
+        dataset.set_worker_offset(offset)
+
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        sampler=sampler,
+        num_workers=num_workers,
+        pin_memory=device_is_cuda,
+        prefetch_factor=(2 if num_workers > 0 else None), # does not run when 0 num_workers
+        persistent_workers=(num_workers > 0),
+        worker_init_fn=worker_init_fn if num_workers > 0 else None,
+    )
+
 # ---------------- sampling loop, we could probably abstract this later on 
 if __name__=="__main__":
-    prompt="Hello, I'm a language model,"
-    num_repeat_sequences=5
-    max_length=30
-    B, T= 4, 32
+    data_path   = "../exploration/input.txt"
+    B, T        = 4, 32
+    lr          = 3e-4
+    max_steps   = 500
 
-    #autodetection for device
-    device="cpu"
+
     if torch.cuda.is_available():
-        device="cuda"
-    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-        device="mps" 
+        device        = torch.device("cuda")
+        use_amp_cuda  = True
+    elif getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+        device        = torch.device("mps")
+        use_amp_cuda  = False
+    else:
+        device        = torch.device("cpu")
+        use_amp_cuda  = False
 
-    torch.manual_seed(42)
-    
     print("Using device:", device)
 
-    train_loader=DataLoaderLite(B, T, device)
+    dataset = TokenTextDataset(path=data_path, block_size=T)
+
+    if torch.cuda.device_count() > 1:
+        torch.distributed.init_process_group(backend="nccl", init_method="env://")
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        torch.cuda.set_device(local_rank)
+        sampler = DistributedSampler(dataset, shuffle=False)
+    else:
+        sampler = None
+
+    loader = make_loader(
+        dataset,
+        batch_size=B,
+        num_workers=0,            # no separate workers ➜ no pickling
+        sampler=sampler,
+        device_is_cuda=device.type == "cuda",
+    )
+
+    model = GPT(GPTConfig()).to(device)
+
+    if torch.cuda.device_count() > 1:
+        model = nn.parallel.DistributedDataParallel(
+            model, device_ids=[torch.cuda.current_device()], output_device=torch.cuda.current_device()
+        ) # sync gradients
+
+    optimiser = torch.optim.AdamW(model.parameters(), lr=lr)
+    scaler_device   = "cuda" if device.type == "cuda" else "cpu"
+    use_device_amp  = device.type == "cuda"               # enable only on CUDA
+    scaler          = torch.amp.GradScaler(scaler_device,
+                                     enabled=use_device_amp)
+
+    model.train()
+    for step, (x, y) in enumerate(loader):
+        if step >= max_steps:
+            break
+
+        x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
+
+        optimiser.zero_grad(set_to_none=True)
+
+        with torch.amp.autocast(device.type, enabled=use_amp_cuda):
+            logits, loss = model(x, y)
+
+        scaler.scale(loss).backward()
+        scaler.step(optimiser)
+        scaler.update()
+
+        if sampler is not None:
+            sampler.set_epoch(step)  # shuffle shards every epoch
 
 
-    #model=GPT.from_pretrained('gpt2')
-    model=GPT(GPTConfig())
-    print("Model Weights Load Done")
+        print(f"step {step:6d}  loss {loss.item():.4f}")
 
-    model.eval() #turns it into eval mode, which is good practice apparently
-    model.to(device)
+    print("training loop finished ✔")
 
-    #small batch overfitting
-    optimiser=torch.optim.AdamW(model.parameters(), lr=3e-4) #model.parameters() comes from nn.module which all our layers are inherited from
+    model.eval()
+    prompt = "Hello, I'm a language model,"
+    enc = tiktoken.get_encoding("gpt2")
+    x   = torch.tensor(enc.encode(prompt), dtype=torch.long, device=device)[None, :]
+    torch.manual_seed(42)
+    while x.size(1) < 50:
+        with torch.no_grad():
+            logits, _ = model(x)
+            probs = F.softmax(logits[:, -1, :], dim=-1)
+            next_token = torch.multinomial(probs, num_samples=1)
+            x = torch.cat([x, next_token], dim=1)
+    print(enc.decode(x[0].tolist()))
 
-    for i in range(10000):
-        x, y= train_loader.get_next_batch()
-        optimiser.zero_grad() #we are not doing gradient accumulation, so no need to keep gradients, this is not the same as zeroing the weights take note
-        logits,loss=model(x, y)
-        loss.backward() #loss backwards is surprisingly not just a number but a graph that pytorch builds. Starts with a scalar at the end and traverses it backwards, using chainrule to work out gradient at every stage
-        optimiser.step() #optimiser step is the weight update, e.g weight=weight-lr*gradient (for adamW add your first moment second moment)
-        print(f'step:{i},  loss:{loss.item()}')
+    def smoke_test(loader, n_batches: int = 3):
+        print("running loader smoke-test:")
+        for step, (x, y) in enumerate(loader):
+            print(f"\nBatch {step}  ------------------------------------")
+            print(f"x shape {tuple(x.shape)}, dtype {x.dtype}")
+            print(f"y shape {tuple(y.shape)}, dtype {y.dtype}")
 
+            # shape & dtype checks
+            assert x.shape == (B, T)
+            assert y.shape == (B, T)
+            assert x.dtype == torch.long and y.dtype == torch.long
+
+            # target-shift check:  y[b, t]  must equal  x[b, t+1]
+            same = torch.all(y[:, :-1] == x[:, 1:])
+            if not same:
+                idx = (y[:, :-1] != x[:, 1:]).nonzero(as_tuple=False)[0]
+                b, t = idx.tolist()
+                raise ValueError(f"y is not a left-shifted copy of x at (batch={b}, pos={t})")
+            print("✓ shapes & left-shift OK")
+
+            # simple uniqueness check – tokens should not all be identical
+            uniq = torch.unique(x).numel()
+            print(f"unique tokens in x: {uniq}")
+            assert uniq > 1, "looks like the same token repeated – did shuffling break?"
+
+            if step + 1 == n_batches:
+                break
+
+        print("\n**** DataLoader smoke-test passed ****")
+
+    smoke_test(loader)
     import  sys;sys.exit(0)
 
     """
