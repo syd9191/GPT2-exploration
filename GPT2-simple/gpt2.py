@@ -6,6 +6,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import IterableDataset, DataLoader, DistributedSampler
+import matplotlib.pyplot as plt
 import tiktoken
 
 #---------------------------------------------------------
@@ -247,6 +248,43 @@ class GPT(nn.Module):
 
         return model
 
+class ModelTracker:
+    def __init__(self, 
+                model:torch.nn.Module,
+                plot_path:str, 
+                model_path:str):
+
+        self.losses:list=[]
+        self.best_loss:float=float('inf')
+        self.plot_path:str=plot_path
+        self.model_path:str=model_path 
+        self.best_weights=None
+        self.model=model
+
+    def add_loss(self, loss):
+        self.losses.append(loss)
+        if loss<self.best_loss and self.model is not None:
+            self.best_loss=loss
+            self.best_weights=self.model.state_dict()
+
+    def save_best_weights(self):
+        if self.best_weights is not None:
+            torch.save(self.best_weights, self.model_path)
+    
+    def plot_loss(self, show=True):
+        plt.figure(figsize=(8, 5))
+        plt.plot(self.losses, label="Training Loss")
+        plt.xlabel("Step")
+        plt.ylabel("Loss")
+        plt.title("Training Loss Curve")
+        plt.grid(True)
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(self.plot_path, dpi=300)
+        if show:
+            plt.show()
+        
+
 def make_loader(dataset: TokenTextDataset, batch_size: int, num_workers: int,
                 sampler: DistributedSampler | None, device_is_cuda: bool):
     def worker_init_fn(worker_id: int):
@@ -269,10 +307,12 @@ def make_loader(dataset: TokenTextDataset, batch_size: int, num_workers: int,
 
 # ---------------- sampling loop, we could probably abstract this later on 
 if __name__=="__main__":
-    data_path   = "../exploration/input.txt"
+    data_path   = "./exploration/input.txt"
+    plot_path   = "./plots/training_loss_curve.png"
+    model_path  = "./models/gpt-2-tinyshakespeare.pth"
     B, T        = 4, 32
     lr          = 3e-4
-    max_steps   = 500
+    max_steps   = 1000
 
 
     if torch.cuda.is_available():
@@ -319,6 +359,11 @@ if __name__=="__main__":
                                      enabled=use_device_amp)
 
     model.train()
+
+    model_tracker=ModelTracker(model=model,
+                            plot_path=plot_path,
+                            model_path=model_path)
+    
     for step, (x, y) in enumerate(loader):
         if step >= max_steps:
             break
@@ -329,6 +374,8 @@ if __name__=="__main__":
 
         with torch.amp.autocast(device.type, enabled=use_amp_cuda):
             logits, loss = model(x, y)
+
+        model_tracker.add_loss(loss.item())
 
         scaler.scale(loss).backward()
         scaler.step(optimiser)
@@ -341,6 +388,9 @@ if __name__=="__main__":
         print(f"step {step:6d}  loss {loss.item():.4f}")
 
     print("training loop finished ✔")
+
+    model_tracker.plot_loss(show=True)
+    model_tracker.save_best_weights()
 
     model.eval()
     prompt = "Hello, I'm a language model,"
