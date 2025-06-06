@@ -1,4 +1,5 @@
 import os, random
+import time
 from pathlib import Path
 from dataclasses import dataclass
 
@@ -8,6 +9,7 @@ import torch.nn.functional as F
 from torch.utils.data import IterableDataset, DataLoader, DistributedSampler
 import matplotlib.pyplot as plt
 import tiktoken
+import json
 
 #---------------------------------------------------------
 @dataclass
@@ -43,6 +45,9 @@ class TokenTextDataset(IterableDataset):
     def set_worker_offset(self, offset: int):
         self._worker_offset = offset
 
+    def get_dataset_token_count(self):
+        return len(self.tokens)
+
     def __iter__(self):
         n   = len(self.tokens)
         pos = self._worker_offset % n
@@ -58,6 +63,7 @@ class TokenTextDataset(IterableDataset):
             y      = chunk[ 1:]                                             # (T,)
             pos   += self.block_size
             yield x, y                                                      # DataLoader → (B,T)
+
 
 class DataLoaderLite():
     def __init__(self, B, T, device):
@@ -247,21 +253,76 @@ class GPT(nn.Module):
                     sd[k].copy_(sd_hf[k])
 
         return model
+    
+    def load_weights(self,
+                    path:str,
+                    device:str="cpu",
+                    strict:bool=True):
+        
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"The file path: {path} does not exist")
+        state_dict=torch.load(path, map_location=device)
+        self.load_state_dict(state_dict,strict=strict)
+        print(f"Model weights loaded from {path}")
 
 class ModelTracker:
     def __init__(self, 
                 model:torch.nn.Module,
+                batch_size:int, 
+                seq_length:int, 
+                total_tokens:int, 
                 plot_path:str, 
-                model_path:str):
+                model_path:str,
+                stats_path:str):
 
         self.losses:list=[]
+        self.batch_size=batch_size
+        self.seq_length=seq_length
+        self.total_tokens=total_tokens
         self.best_loss:float=float('inf')
-        self.plot_path:str=plot_path
-        self.model_path:str=model_path 
+        self.plot_path:Path=Path(plot_path)
+        self.model_path:Path=Path(model_path)
+        self.stats_path:Path=Path(stats_path)
         self.best_weights=None
         self.model=model
+        self.stats={"Tokens Exposed": 0,
+                    "Steps Trained": 0,
+                    "Epochs": 0,
+                    "Best Loss": float('inf'),
+                    "Time Spent Training":0,
+                    "Model Path":str(self.model_path),
+                    "Batch Size": self.batch_size,
+                    }
+        self._load()
 
-    def add_loss(self, loss):
+    def _load(self):
+        if os.path.exists(self.stats_path):
+            with open(self.stats_path, "r") as f:
+                self.stats.update(json.load(f))
+
+    def save_stats(self):
+        self.stats_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        try:
+            with open(self.stats_path, "w") as f:
+                json.dump(self.stats, f, indent=4)
+        except Exception as e:
+            raise ValueError(f"Json object cannot be saved: {e}")
+    
+    def update(self,
+           time_interval: float,
+           curr_loss: float):
+        
+        self.stats["Epochs"] += 1
+        self.stats["Tokens Exposed"] += self.total_tokens
+        self.stats["Time Spent Training"] += time_interval
+        self.stats["Steps Trained"] += self.total_tokens // (self.batch_size * self.seq_length)
+        
+        if curr_loss < self.stats["Best Loss"] or self.stats["Best Loss"] == float("inf"):
+            self.stats["Best Loss"] = curr_loss
+            
+    def add_loss(self, 
+                 loss:float):
         self.losses.append(loss)
         if loss<self.best_loss and self.model is not None:
             self.best_loss=loss
@@ -271,7 +332,8 @@ class ModelTracker:
         if self.best_weights is not None:
             torch.save(self.best_weights, self.model_path)
     
-    def plot_loss(self, show=True):
+    def plot_loss(self, 
+                  show:bool=True):
         plt.figure(figsize=(8, 5))
         plt.plot(self.losses, label="Training Loss")
         plt.xlabel("Step")
@@ -308,11 +370,12 @@ def make_loader(dataset: TokenTextDataset, batch_size: int, num_workers: int,
 # ---------------- sampling loop, we could probably abstract this later on 
 if __name__=="__main__":
     data_path   = "./exploration/input.txt"
-    plot_path   = "./plots/training_loss_curve.png"
+    plot_path   = "./analytics/plots/training_loss_curve.png"
     model_path  = "./models/gpt-2-tinyshakespeare.pth"
+    stats_path  = "./analytics/stats/training_stats.json"
     B, T        = 4, 32
     lr          = 3e-4
-    max_steps   = 1000
+    max_steps   = 0
 
 
     if torch.cuda.is_available():
@@ -328,6 +391,9 @@ if __name__=="__main__":
     print("Using device:", device)
 
     dataset = TokenTextDataset(path=data_path, block_size=T)
+    n_tokens= dataset.get_dataset_token_count()
+    epoch_size= int(n_tokens/(B*T))
+    print(f"epoch_size: {epoch_size}")
 
     if torch.cuda.device_count() > 1:
         torch.distributed.init_process_group(backend="nccl", init_method="env://")
@@ -346,6 +412,12 @@ if __name__=="__main__":
     )
 
     model = GPT(GPTConfig()).to(device)
+    try:
+        model.load_weights(model_path)
+    except:
+        #raise RuntimeError("Model Weights Loading Failed")
+        pass
+    
 
     if torch.cuda.device_count() > 1:
         model = nn.parallel.DistributedDataParallel(
@@ -361,9 +433,14 @@ if __name__=="__main__":
     model.train()
 
     model_tracker=ModelTracker(model=model,
+                            batch_size=B,
+                            seq_length=T,
+                            total_tokens=n_tokens,
                             plot_path=plot_path,
-                            model_path=model_path)
+                            model_path=model_path,
+                            stats_path=stats_path )
     
+    start_time=time.time()
     for step, (x, y) in enumerate(loader):
         if step >= max_steps:
             break
@@ -384,6 +461,16 @@ if __name__=="__main__":
         if sampler is not None:
             sampler.set_epoch(step)  # shuffle shards every epoch
 
+        if step%epoch_size==0 and step//epoch_size!=0: #we have reached one epoch
+            end_time=time.time()
+            time_interval=end_time-start_time
+            print(f"--- Epoch {step//epoch_size} Reached ---") 
+            print(f"--- Time Taken: {time_interval} ---") 
+            model_tracker.update(time_interval=time_interval,
+                                 curr_loss=loss.item())
+            model_tracker.save_best_weights()
+            model_tracker.save_stats()
+            start_time=time.time()
 
         print(f"step {step:6d}  loss {loss.item():.4f}")
 
@@ -393,7 +480,7 @@ if __name__=="__main__":
     model_tracker.save_best_weights()
 
     model.eval()
-    prompt = "Hello, I'm a language model,"
+    prompt = "MARCIUS: \n Let the first budger die the other's slave,"
     enc = tiktoken.get_encoding("gpt2")
     x   = torch.tensor(enc.encode(prompt), dtype=torch.long, device=device)[None, :]
     torch.manual_seed(42)

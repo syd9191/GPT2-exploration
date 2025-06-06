@@ -1,0 +1,9 @@
+{
+    "Tokens Exposed": 74536266,
+    "Steps Trained": 582306,
+    "Epochs": 183,
+    "Best Loss": 0.06726303696632385,
+    "Time Spent Training": 49664.14374375343,
+    "Model Path": "models/gpt-2-tinyshakespeare.pth",
+    "Batch Size": 4
+}
