@@ -24,8 +24,60 @@ class GPTConfig:
     n_head:int=12
     n_embd:int=768
 
+class DirStreamingDataset(IterableDataset):
+    """
+    openwebtext directory now contains pt files in binary, precomputed with the GPT 2 encodings
+
+    Each file is 10 million tokens, total of 904 files
+    """
+
+    def __init__(self, path: str | os.PathLike, block_size: int):
+        self.dir_path = Path(path)
+        if not self.dir_path.exists():
+            raise FileNotFoundError(path)
+        
+        self.token_files=sorted(self.dir_path.glob("*.pt"))
+        if not self.token_files:
+            raise ValueError(f"No .pt files found in {self.dir_path}")
+        self.num_files=len(self.token_files)
+        self.block_size = block_size
+        self.num_token_per_file=10000000
+
+        # introduce per-worker offset to avoid every worker seeing the
+        # same sequence order when shuffling is disallowed.
+        # DataLoader(worker_init_fn) will set this value.
+        self._worker_offset = 0
+
+
+    # DataLoader with an IterableDataset must NOT shuffle. We instead start each worker at a random offset to approximate randomness.
+    def set_worker_offset(self, offset: int):
+        self._worker_offset = offset
+
+    def get_dataset_token_count(self):
+        return self.num_files*self.num_token_per_file
+
+    def __iter__(self):
+        rng = torch.Generator().manual_seed(42 + self._worker_offset)
+        file_indices = list(range(len(self.token_files)))
+        random.shuffle(file_indices)
+
+        while True:
+            for idx in file_indices:
+                tokens = torch.load(self.token_files[idx])
+                n = len(tokens)
+                pos = torch.randint(0, n - self.block_size - 1, (1,), generator=rng).item()
+
+                while pos + self.block_size + 1 < n:
+                    #now instead of randomising the start position, we randomise which file we see, then the start position is sequential
+                    chunk = tokens[pos : pos + self.block_size + 1]
+                    x = chunk[:-1]
+                    y = chunk[1:]
+                    pos += self.block_size
+                    yield x, y# DataLoader → (B,T)
+
 class TokenTextDataset(IterableDataset):
     """
+    NOT IN USE
     Streams the entire file token-by-token forever, returning sa contiguous
     sliding window of `block_size` for x and the next-token labels for y.
     """
@@ -70,6 +122,9 @@ class TokenTextDataset(IterableDataset):
 
 
 class DataLoaderLite():
+    """
+    NOT IN USE
+    """
     def __init__(self, B, T, device):
         self.device=device
         self.B=B
@@ -277,6 +332,11 @@ class GPT(nn.Module):
                       scaler:torch.amp.GradScaler,
                       optimiser:torch.optim
                       ):
+        """
+        I dont think training loop should be in the GPT2 class specifically, for convenience I put it here first 
+
+        TODO: Model Training class
+        """
         try:
             start_time=time.time()
 
@@ -351,6 +411,9 @@ class ModelTracker:
                     "Model Path":str(self.model_path),
                     "Batch Size": self.batch_size,
                     }
+        
+        for path in [self.plot_path, self.model_path, self.stats_path, self.loss_path]:
+            path.parent.mkdir(parents=True, exist_ok=True)
         
         self._load()
 
@@ -441,22 +504,22 @@ def make_loader(dataset: TokenTextDataset, batch_size: int, num_workers: int,
 
 # ---------------- sampling loop, we could probably abstract this later on 
 if __name__=="__main__":
-    data_path   = "./data/input.txt"
-    model_name  = "gpt-2-tinyshakespeare"
+    data_path   = "./data/openwebtext"
+    model_name  = "gpt-2"
     B, T        = 4, 32
     lr          = 3e-4
     max_steps   = 100000
 
-    plot_path   = f"./analytics/plots/{model_name}_loss_curve.png"
-    model_path  = f"./models/{model_name}.pth"
-    stats_path  = f"./analytics/stats/{model_name}_training_stats.json"
-    loss_path   = f"./analytics/stats/{model_name}.npy"
+    plot_path   = f"./analytics/{model_name}/plots/{model_name}_loss_curve.png"
+    model_path  = f"./models/{model_name}/{model_name}.pth"
+    stats_path  = f"./analytics/{model_name}/stats/{model_name}_training_stats.json"
+    loss_path   = f"./analytics/{model_name}/stats/{model_name}.npy"
     
 
 
     device, use_amp_cuda = utils.get_device(verbose=True)
 
-    dataset = TokenTextDataset(path=data_path, block_size=T)
+    dataset = DirStreamingDataset(path=data_path, block_size=T)
     n_tokens= dataset.get_dataset_token_count()
     epoch_size= int(n_tokens/(B*T))
     print(f"epoch_size: {epoch_size}")
