@@ -13,6 +13,8 @@ import matplotlib.pyplot as plt
 import tiktoken
 import json
 import numpy as np
+import time
+import math
 
 #custom
 import utils
@@ -189,7 +191,7 @@ class CausalSelfAttention(nn.Module):
         q=q.contiguous().view(B,T,self.n_head,C//self.n_head).transpose(1,2) #final output dimension [B,n_head,T,hs]
         v=v.contiguous().view(B,T,self.n_head,C//self.n_head).transpose(1,2) #final output dimension [B,n_head,T,hs]
 
-        y=F.scaled_dot_product_attention(q,k,v, is_causal=True) #normal dot prod calculation of attention, this one might use flash_attn not very sure
+        y=F.scaled_dot_product_attention(q,k,v, is_causal=True) #normal dot prod calculation of attention, Yes this one uses flash attention
         y=y.transpose(1,2).contiguous().view(B,T,C) #reassembles the heads back to the original dimensions
         
         y=self.c_proj(y)
@@ -344,11 +346,39 @@ class GPT(nn.Module):
         state_dict = remove_module_prefix(state_dict)
         model.load_state_dict(state_dict)
         print(f"Model weights loaded from {path}")
+
+    def configure_optimizers(self, weight_decay, learning_rate, device_type):
+        # start with all of the candidate parameters (that require grad)
+        param_dict = {pn: p for pn, p in self.named_parameters()}
+        param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
+        # create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.
+        # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
+        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
+        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+        optim_groups = [
+            {'params': decay_params, 'weight_decay': weight_decay},
+            {'params': nodecay_params, 'weight_decay': 0.0}
+        ]
+        num_decay_params = sum(p.numel() for p in decay_params)
+        num_nodecay_params = sum(p.numel() for p in nodecay_params)
+
+        print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
+        print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
+        # Create AdamW optimizer and use the fused version if it is available
+        try:
+            optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=True)
+            print("Using fused AdamW.")
+        except TypeError as e:
+            print("Fused AdamW not supported, using unfused kernal.")
+            optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8)
+        return optimizer
     
 
     def training_loop(self,
                       max_steps:int,
                       save_interval:int, 
+                      batch_size:int,
+                      seq_len:int, 
                       loader:DataLoader, 
                       device:str, 
                       scaler:torch.amp.GradScaler,
@@ -360,17 +390,17 @@ class GPT(nn.Module):
         TODO: Model Training class
         """
         try:
-            start_time=time.time()
 
             for step, (x, y) in enumerate(loader):
+                start_time=time.time()
+                t0=time.time()
                 if step >= max_steps:
                     break
 
                 x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
 
                 optimiser.zero_grad(set_to_none=True)
-
-                with torch.amp.autocast(device.type, enabled=use_amp_cuda):
+                with torch.autocast(device_type=device,dtype=torch.bfloat16, enabled=use_amp_cuda):
                     logits, loss = model(x, y)
 
                 model_tracker.add_loss(loss.item())
@@ -378,6 +408,20 @@ class GPT(nn.Module):
                 scaler.scale(loss).backward()
                 scaler.step(optimiser)
                 scaler.update()
+                norm=torch.nn.utils.clip_grad_norm_(self.parameters(), 1.0)
+                
+                lr=utils.get_lr(step=step,
+                               max_steps=max_steps)
+                
+                for param_group in optimiser.param_groups:
+                    param_group['lr']=lr
+                    
+
+                torch.cuda.synchronize()
+                t1=time.time()
+                time_diff_ms=(t1-t0)*1000
+                tps=(batch_size*seq_len)/(t1-t0)
+
 
                 if sampler is not None:
                     sampler.set_epoch(step)  # shuffle shards every epoch
@@ -393,7 +437,7 @@ class GPT(nn.Module):
                                              curr_step=step)
                     start_time=time.time()
 
-                print(f"step {step:6d}  loss {loss.item():.4f}")
+                print(f"step: {step:6d} | loss: {loss.item():.4f} | time: {time_diff_ms:.2f}ms | tps:{tps:.2f} | norm:{norm:.2f} | lr:{'{0:.2E}'.format(lr)}")
 
             print("training loop finished ✔")
         
@@ -546,10 +590,10 @@ def make_loader(dataset: TokenTextDataset, batch_size: int, num_workers: int,
 if __name__=="__main__":
     data_path     = "./GPT2-exploration/data/openwebtext"
     model_name    = "gpt-2"
-    B, T          = 4, 1024
+    B, T          = 16, 1024
     lr            = 3e-4
-    max_steps     = 100000
-    save_interval = 100
+    max_steps     = 50000000000
+    save_interval = 10000
 
     plot_path   = f"./GPT2-exploration/analytics/{model_name}/plots/{model_name}_loss_curve.png"
     model_path  = f"./GPT2-exploration/models/{model_name}/{model_name}.pth"
@@ -588,13 +632,13 @@ if __name__=="__main__":
                     T=T,
                     loader=loader) #test before training
 
-    model = GPT(GPTConfig()).to(device)
+    model = GPT(GPTConfig(vocab_size=50304)).to(device)
+    model = torch.compile(model)
 
-    print(f"Loading weights from: {model_path}")
-    model.load_weights(model_path,
-                        device=device,
-                        weights_only=True)
-    """
+    optimiser = model.configure_optimizers(weight_decay=0.1,
+                                           learning_rate=6e-4,
+                                           device_type=device)
+
     try:
         print(f"Loading weights from: {model_path}")
         model.load_weights(model_path,
@@ -604,16 +648,12 @@ if __name__=="__main__":
         print(f"No pre-trained weights found at {model_path}. Starting from scratch.")
         pass
     
-    
-    """
-    
 
     if torch.cuda.device_count() > 1:
         model = nn.parallel.DistributedDataParallel(
             model, device_ids=[torch.cuda.current_device()], output_device=torch.cuda.current_device()
         ) # sync gradients
 
-    optimiser = torch.optim.AdamW(model.parameters(), lr=lr)
     scaler_device   = "cuda" if device.type == "cuda" else "cpu"
     use_device_amp  = device.type == "cuda"               # enable only on CUDA
     scaler          = torch.amp.GradScaler(scaler_device,
@@ -634,9 +674,11 @@ if __name__=="__main__":
     model.module.training_loop(max_steps=max_steps,
                   save_interval=save_interval,
                   loader=loader, 
-                  device=device,
+                  device=device.type,
                   scaler=scaler,
-                  optimiser=optimiser)
+                  optimiser=optimiser,
+                  batch_size=B,
+                  seq_len=T)
 
     model.eval()
     prompt = "MARCIUS: "

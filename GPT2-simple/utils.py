@@ -1,5 +1,6 @@
 import torch 
 from typing import Tuple
+import math 
 
 def get_device(verbose:bool=True)->Tuple[torch.device, bool]:
     if torch.cuda.is_available():
@@ -50,3 +51,31 @@ def smoke_test(loader,
                 break
 
         print("\n**** DataLoader smoke-test passed ****")
+
+
+def get_lr( step:int, 
+            max_steps:int, 
+            warmup_steps:int=10,
+            max_lr:float=3e-4):
+        """
+        Follows GPT-3's learning rate with a cosine decay
+
+        From the paper:
+        we clip the global norm of the gradient at 1.0, and we use cosine decay for learning rate down to 10% of its value, over 260 billion tokens (after 260
+        billion tokens, training continues at 10% of the original learning rate). There is a linear LR warmup over the first 375
+        million tokens. We also gradually increase the batch size linearly from a small value (32k tokens) to the full value over
+        the first 4-12 billion tokens of training, depending on the model size. Data are sampled without replacement during
+        training (until an epoch boundary is reached) to minimize overfitting. 
+        """
+        min_lr=max_lr*0.1
+
+        if step<warmup_steps:
+            return max_lr*(step+1)/warmup_steps
+        elif step>max_steps:
+            return min_lr
+        decay_ratio=(step-warmup_steps)/(max_steps-warmup_steps)
+
+        assert 0<=decay_ratio<=1
+        coeff=0.5*(1.0+math.cos(math.pi*decay_ratio))
+
+        return min_lr+coeff*(max_lr-min_lr)
