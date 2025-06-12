@@ -2,11 +2,13 @@ import os, random
 import time
 from pathlib import Path
 from dataclasses import dataclass
+from typing import Union
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import IterableDataset, DataLoader, DistributedSampler
+import torch.distributed as dist
 import matplotlib.pyplot as plt
 import tiktoken
 import json
@@ -31,7 +33,7 @@ class DirStreamingDataset(IterableDataset):
     Each file is 10 million tokens, total of 904 files
     """
 
-    def __init__(self, path: str | os.PathLike, block_size: int):
+    def __init__(self, path: Union[str, os.PathLike], block_size: int):
         self.dir_path = Path(path)
         if not self.dir_path.exists():
             raise FileNotFoundError(path)
@@ -74,6 +76,9 @@ class DirStreamingDataset(IterableDataset):
                     y = chunk[1:]
                     pos += self.block_size
                     yield x, y# DataLoader → (B,T)
+    def __len__(self):
+        # Just return an estimate or token count divided by block size
+        return self.get_dataset_token_count() // self.block_size     
 
 class TokenTextDataset(IterableDataset):
     """
@@ -82,7 +87,7 @@ class TokenTextDataset(IterableDataset):
     sliding window of `block_size` for x and the next-token labels for y.
     """
 
-    def __init__(self, path: str | os.PathLike, block_size: int):
+    def __init__(self, path: Union[str,os.PathLike], block_size: int):
         path = Path(path)
         if not path.exists():
             raise FileNotFoundError(path)
@@ -118,7 +123,9 @@ class TokenTextDataset(IterableDataset):
             x      = chunk[:-1]                                             # (T,)
             y      = chunk[ 1:]                                             # (T,)
             pos   += self.block_size
-            yield x, y                                                      # DataLoader → (B,T)
+            yield x, y    
+            
+                                             # DataLoader → (B,T)
 
 
 class DataLoaderLite():
@@ -316,17 +323,32 @@ class GPT(nn.Module):
     def load_weights(self,
                     path:str,
                     device:str="cpu",
-                    strict:bool=True):
+                    strict:bool=True, 
+                    weights_only:bool=True):
+        
+        def remove_module_prefix(state_dict):
+            new_state_dict = {}
+            for k, v in state_dict.items():
+                if k.startswith("module."):
+                    new_key = k[len("module."):]
+                else:
+                    new_key = k
+                new_state_dict[new_key] = v
+            return new_state_dict
         
         if not os.path.exists(path):
             raise FileNotFoundError(f"The file path: {path} does not exist")
-        state_dict=torch.load(path, map_location=device)
-        self.load_state_dict(state_dict,strict=strict)
+        
+        checkpoint = torch.load(model_path, map_location='cpu')  # or your device
+        state_dict = checkpoint['state_dict'] if 'state_dict' in checkpoint else checkpoint
+        state_dict = remove_module_prefix(state_dict)
+        model.load_state_dict(state_dict)
         print(f"Model weights loaded from {path}")
     
 
     def training_loop(self,
                       max_steps:int,
+                      save_interval:int, 
                       loader:DataLoader, 
                       device:str, 
                       scaler:torch.amp.GradScaler,
@@ -360,14 +382,17 @@ class GPT(nn.Module):
                 if sampler is not None:
                     sampler.set_epoch(step)  # shuffle shards every epoch
 
-                if step%epoch_size==0 and step//epoch_size!=0: #we have reached one epoch
+                if step!=0 and step%save_interval==0: #autosave_checkpoint
                     end_time=time.time()
                     time_interval=end_time-start_time
+
                     print(f"--- Epoch {step//epoch_size} Reached ---") 
                     print(f"--- Time Taken: {time_interval} ---") 
+
                     model_tracker.update_all(time_interval=time_interval,
-                                             curr_loss=loss.item())
+                                             curr_step=step)
                     start_time=time.time()
+
                 print(f"step {step:6d}  loss {loss.item():.4f}")
 
             print("training loop finished ✔")
@@ -379,7 +404,7 @@ class GPT(nn.Module):
             end_time=time.time()
             time_interval=end_time-start_time
             model_tracker.update_all(time_interval=time_interval,
-                                             curr_loss=loss.item())
+                                    curr_step=step)
 
 class ModelTracker:
     def __init__(self, 
@@ -393,9 +418,10 @@ class ModelTracker:
                 loss_path:str):
         
         self.losses:list=[]
-        self.batch_size=batch_size
-        self.seq_length=seq_length
-        self.total_tokens=total_tokens
+        self.batch_size:int=batch_size
+        self.seq_length:int=seq_length
+        self.total_tokens:int=total_tokens
+        self.last_step_updated:int=0
         self.best_loss:float=float('inf')
         self.plot_path:Path=Path(plot_path)
         self.model_path:Path=Path(model_path)
@@ -403,13 +429,15 @@ class ModelTracker:
         self.loss_path:Path=Path(loss_path)
         self.best_weights=None
         self.model=model
+        
+
         self.stats={"Tokens Exposed": 0,
                     "Steps Trained": 0,
                     "Epochs": 0,
                     "Best Loss": float('inf'),
                     "Time Spent Training":0,
                     "Model Path":str(self.model_path),
-                    "Batch Size": self.batch_size,
+                    "Batch Size": self.batch_size
                     }
         
         for path in [self.plot_path, self.model_path, self.stats_path, self.loss_path]:
@@ -427,32 +455,44 @@ class ModelTracker:
 
     def update_all(self,
                    time_interval:float,
-                   curr_loss:float):
+                   curr_step:int):
         self.update(time_interval=time_interval,
-                    curr_loss=curr_loss)
+                    curr_step=curr_step,
+                    last_step_updated=self.last_step_updated)
+        
+        self.last_step_updated=curr_step
         self.save_best_weights()
         self.save_stats()
         self.plot_loss()
 
     def save_stats(self):
+    # Only save from the main process (rank 0)
+        if dist.is_initialized():
+            if dist.get_rank() != 0:
+                return  # Skip saving in all but rank 0
+
         self.stats_path.parent.mkdir(parents=True, exist_ok=True)
         
         try:
             with open(self.stats_path, "w") as f:
                 json.dump(self.stats, f, indent=4)
-
         except Exception as e:
             raise ValueError(f"Json object cannot be saved: {e}")
     
     def update(self,
            time_interval:float,
-           curr_loss:float):
-        
-        self.stats["Epochs"] += 1
-        self.stats["Tokens Exposed"] += self.total_tokens
+           curr_step:int,
+           last_step_updated:int):
+        """
+        Updates Stats based on how many steps have been taken
+        """
+        steps=curr_step-last_step_updated
+        self.stats["Steps Trained"] += steps
+        self.stats["Epochs"] += (self.batch_size*self.seq_length*steps)/self.total_tokens
+        self.stats["Tokens Exposed"] += self.batch_size*self.seq_length*steps
         self.stats["Time Spent Training"] += time_interval
-        self.stats["Steps Trained"] += self.total_tokens // (self.batch_size * self.seq_length)
         self.stats["Best Loss"] = self.best_loss
+
         
         np.save(self.loss_path, np.array(self.losses)) #store loss in a npy file, storing in json is retarded
         
@@ -483,18 +523,18 @@ class ModelTracker:
         
 
 def make_loader(dataset: TokenTextDataset, batch_size: int, num_workers: int,
-                sampler: DistributedSampler | None, device_is_cuda: bool):
+                sampler: Union[DistributedSampler,None], device_is_cuda: bool):
     def worker_init_fn(worker_id: int):
         worker_info = torch.utils.data.get_worker_info()
         dataset: TokenTextDataset = worker_info.dataset
-        offset = random.randint(0, len(dataset.tokens) - 1)
+        offset = random.randint(0, dataset.num_token_per_file - 1)
         dataset.set_worker_offset(offset)
 
     return DataLoader(
         dataset,
         batch_size=batch_size,
         shuffle=False,
-        sampler=sampler,
+        sampler=None,
         num_workers=num_workers,
         pin_memory=device_is_cuda,
         prefetch_factor=(2 if num_workers > 0 else None), # does not run when 0 num_workers
@@ -504,22 +544,26 @@ def make_loader(dataset: TokenTextDataset, batch_size: int, num_workers: int,
 
 # ---------------- sampling loop, we could probably abstract this later on 
 if __name__=="__main__":
-    data_path   = "./data/openwebtext"
-    model_name  = "gpt-2"
-    B, T        = 4, 32
-    lr          = 3e-4
-    max_steps   = 100000
+    data_path     = "./GPT2-exploration/data/openwebtext"
+    model_name    = "gpt-2"
+    B, T          = 4, 1024
+    lr            = 3e-4
+    max_steps     = 100000
+    save_interval = 100
 
-    plot_path   = f"./analytics/{model_name}/plots/{model_name}_loss_curve.png"
-    model_path  = f"./models/{model_name}/{model_name}.pth"
-    stats_path  = f"./analytics/{model_name}/stats/{model_name}_training_stats.json"
-    loss_path   = f"./analytics/{model_name}/stats/{model_name}.npy"
-    
+    plot_path   = f"./GPT2-exploration/analytics/{model_name}/plots/{model_name}_loss_curve.png"
+    model_path  = f"./GPT2-exploration/models/{model_name}/{model_name}.pth"
+    stats_path  = f"./GPT2-exploration/analytics/{model_name}/stats/{model_name}_training_stats.json"
+    loss_path   = f"./GPT2-exploration/analytics/{model_name}/stats/{model_name}.npy"
 
+    dir_path=Path(data_path)
 
     device, use_amp_cuda = utils.get_device(verbose=True)
 
     dataset = DirStreamingDataset(path=data_path, block_size=T)
+
+    torch.set_float32_matmul_precision('high')
+
     n_tokens= dataset.get_dataset_token_count()
     epoch_size= int(n_tokens/(B*T))
     print(f"epoch_size: {epoch_size}")
@@ -535,7 +579,7 @@ if __name__=="__main__":
     loader = make_loader(
         dataset,
         batch_size=B,
-        num_workers=0,            # no separate workers ➜ no pickling
+        num_workers=4,            # no separate workers ➜ no pickling
         sampler=sampler,
         device_is_cuda=device.type == "cuda",
     )
@@ -545,12 +589,23 @@ if __name__=="__main__":
                     loader=loader) #test before training
 
     model = GPT(GPTConfig()).to(device)
+
+    print(f"Loading weights from: {model_path}")
+    model.load_weights(model_path,
+                        device=device,
+                        weights_only=True)
+    """
     try:
         print(f"Loading weights from: {model_path}")
-        model.load_weights(model_path)
+        model.load_weights(model_path,
+                           device=device,
+                           weights_only=True)
     except:
         print(f"No pre-trained weights found at {model_path}. Starting from scratch.")
         pass
+    
+    
+    """
     
 
     if torch.cuda.device_count() > 1:
@@ -576,7 +631,8 @@ if __name__=="__main__":
                             loss_path=loss_path )
     
 
-    model.training_loop(max_steps=max_steps,
+    model.module.training_loop(max_steps=max_steps,
+                  save_interval=save_interval,
                   loader=loader, 
                   device=device,
                   scaler=scaler,
