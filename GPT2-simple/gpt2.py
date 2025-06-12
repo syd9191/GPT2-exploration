@@ -272,6 +272,8 @@ class GPT(nn.Module):
 
     def training_loop(self,
                       max_steps:int,
+                      batch_size:int, 
+                      seq_len:int, 
                       loader:DataLoader, 
                       device:str, 
                       scaler:torch.amp.GradScaler,
@@ -281,6 +283,7 @@ class GPT(nn.Module):
             start_time=time.time()
 
             for step, (x, y) in enumerate(loader):
+                t0=time.time()
                 if step >= max_steps:
                     break
 
@@ -297,6 +300,13 @@ class GPT(nn.Module):
                 scaler.step(optimiser)
                 scaler.update()
 
+                torch.cuda.synchronize()
+                t1=time.time()
+                time_diff_ms=(t1-t0)*1000
+                tps=(batch_size*seq_len)/(t1-t0)
+                
+                norm=torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+
                 if sampler is not None:
                     sampler.set_epoch(step)  # shuffle shards every epoch
 
@@ -308,7 +318,7 @@ class GPT(nn.Module):
                     model_tracker.update_all(time_interval=time_interval,
                                              curr_loss=loss.item())
                     start_time=time.time()
-                print(f"step {step:6d}  loss {loss.item():.4f}")
+                print(f"step: {step:6d} | loss: {loss.item():.4f} | time: {time_diff_ms:.2f}ms | tps:{tps:.2f} | norm:{norm:.2f} | lr:{'{0:.2E}'.format(lr)}")
 
             print("training loop finished ✔")
         
@@ -514,6 +524,8 @@ if __name__=="__main__":
     
 
     model.training_loop(max_steps=max_steps,
+                  batch_size=B,
+                  seq_len=T, 
                   loader=loader, 
                   device=device,
                   scaler=scaler,
