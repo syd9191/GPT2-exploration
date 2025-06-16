@@ -1,6 +1,12 @@
 import torch 
-from typing import Tuple
 import math 
+import random
+
+from typing import Tuple, Union
+from dataloaders.dir_streaming_dataset import DirStreamingDataset
+from torch.utils.data import DataLoader, DistributedSampler
+
+
 
 def get_device(verbose:bool=True)->Tuple[torch.device, bool]:
     if torch.cuda.is_available():
@@ -79,3 +85,23 @@ def get_lr( step:int,
         coeff=0.5*(1.0+math.cos(math.pi*decay_ratio))
 
         return min_lr+coeff*(max_lr-min_lr)
+
+def make_loader(dataset: DirStreamingDataset, batch_size: int, num_workers: int,
+                sampler: Union[DistributedSampler,None], device_is_cuda: bool):
+    def worker_init_fn(worker_id: int):
+        worker_info = torch.utils.data.get_worker_info()
+        dataset: DirStreamingDataset = worker_info.dataset
+        offset = random.randint(0, dataset.num_token_per_file - 1)
+        dataset.set_worker_offset(offset)
+
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        sampler=None,
+        num_workers=num_workers,
+        pin_memory=device_is_cuda,
+        prefetch_factor=(2 if num_workers > 0 else None), # does not run when 0 num_workers
+        persistent_workers=(num_workers > 0),
+        worker_init_fn=worker_init_fn if num_workers > 0 else None,
+    )
