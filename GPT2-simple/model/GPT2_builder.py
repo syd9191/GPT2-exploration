@@ -1,9 +1,13 @@
+import os
+import time
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import os
+import tiktoken
+from tiktoken.core import Encoding
 from torch.utils.data import DataLoader, DistributedSampler
-import time
+import torch.distributed as dist
+
 
 
 # ------- Custom -------
@@ -80,11 +84,13 @@ class Block(nn.Module):
 class GPT(nn.Module):
     def __init__(self, 
                  config:GPTConfig,
+                 enc:Encoding, 
                  sampler:DistributedSampler): 
         super().__init__()
 
         self.config=config
         self.sampler=sampler
+        self.enc=enc
 
 
         self.transformer=nn.ModuleDict(dict(
@@ -233,16 +239,53 @@ class GPT(nn.Module):
             optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8)
         return optimizer
     
+    def val_loss(self,
+                val_loader:DataLoader,
+                device:str,
+                ddp:bool
+                ):
+        """
+        Gets Val Loss by evaluating 20 random sequences, no backprop on this function
+        """
+        val_loss_accum=0.0
+        val_loss_steps=20
+        self.eval()
+
+        with torch.no_grad():
+            for step, (x,y) in enumerate(val_loader):
+                if step>=val_loss_steps:
+                    break #we only need one example
+                x,y=x.to(device, non_blocking=True), y.to(device, non_blocking=True)
+                with torch.autocast(device_type=device, dtype=torch.bfloat16, enabled=True):
+                    logits, loss=self(x,y)
+                loss=loss/val_loss_steps
+                val_loss_accum+=loss.detach()
+
+        avg_loss = torch.tensor(val_loss_accum / val_loss_steps, device=device)
+
+        if ddp:
+            dist.all_reduce(avg_loss, op=dist.ReduceOp.AVG)
+
+        if not ddp or (dist.is_initialized() and dist.get_rank()==0):
+            print(f'Val Loss: {avg_loss.item():.4f}')
+
+        self.train()
+        
+
 
     def training_loop(self,
                       max_steps:int,
                       save_interval:int, 
                       batch_size:int,
-                      seq_len:int, 
-                      use_amp_cuda:bool, 
-                      loader:DataLoader, 
-                      model_tracker:ModelTracker,
+                      seq_len:int,
+                      test_prompt:str,
                       device:str, 
+                      grad_accum_steps:int,  
+                      use_amp_cuda:bool, 
+                      ddp:bool, 
+                      loader:DataLoader, 
+                      val_loader:DataLoader, 
+                      model_tracker:ModelTracker,
                       scaler:torch.amp.GradScaler,
                       optimiser:torch.optim
                       ):
@@ -252,62 +295,87 @@ class GPT(nn.Module):
         TODO: Model Training class
         """
         try:
+            self.train()
+            t0=time.time()
+            step=0
 
-            for step, (x, y) in enumerate(loader):
-                start_time=time.time()
-                t0=time.time()
+            for batch_idx, (x, y) in enumerate(loader):
                 if step >= max_steps:
                     break
 
                 x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
 
-                optimiser.zero_grad(set_to_none=True)
-                with torch.autocast(device_type=device,dtype=torch.bfloat16, enabled=use_amp_cuda):
+                with torch.autocast(device_type=device, dtype=torch.bfloat16, enabled=use_amp_cuda):
                     logits, loss = self(x, y)
-
-                model_tracker.add_loss(loss.item())
+                    loss = loss / grad_accum_steps
 
                 scaler.scale(loss).backward()
-                scaler.step(optimiser)
-                scaler.update()
-                norm=torch.nn.utils.clip_grad_norm_(self.parameters(), 1.0)
-                
-                lr=utils.get_lr(step=step,
-                               max_steps=max_steps)
-                
-                for param_group in optimiser.param_groups:
-                    param_group['lr']=lr
-                    
 
-                torch.cuda.synchronize()
-                t1=time.time()
-                time_diff_ms=(t1-t0)*1000
-                tps=(batch_size*seq_len)/(t1-t0)
+                if (batch_idx + 1) % grad_accum_steps == 0:
+                    if step%100==0:
+                        self.val_loss(val_loader=val_loader,
+                                    device=device,
+                                    ddp=ddp,
+                                    )
+                        model_response=self.invoke(max_new_tokens=30,
+                                    prompt=test_prompt,
+                                    device=device)
+                        if not ddp or (dist.is_initialized() and dist.get_rank()==0):
+                            print(model_response)
+                        self.train()
 
+                    norm = torch.nn.utils.clip_grad_norm_(self.parameters(), 1.0)
+                    scaler.step(optimiser)
+                    scaler.update()
+                    optimiser.zero_grad(set_to_none=True)
 
-                if self.sampler is not None:
-                    self.sampler.set_epoch(step)  # shuffle shards every epoch
+                    # Logging and tracking
+                    model_tracker.add_loss(loss.item() * grad_accum_steps)
+                    lr = utils.get_lr(step=step, max_steps=max_steps)
+                    for param_group in optimiser.param_groups:
+                        param_group['lr'] = lr
 
-                if step!=0 and step%save_interval==0: #autosave_checkpoint
-                    end_time=time.time()
-                    time_interval=end_time-start_time
+                    torch.cuda.synchronize()
+                    t1 = time.time()
+                    tps = (batch_size * seq_len * grad_accum_steps) / (t1 - t0)
+                    print(f"step: {step:6d} | loss: {loss.item() * grad_accum_steps:.4f} | tps: {tps:.2f} | dt: {t1-t0} | norm: {norm:.2f} | lr: {'{0:.2E}'.format(lr)}")
 
-                    print(f"--- Save Interval {step/save_interval} Reached ---") 
-                    print(f"--- Time Taken: {time_interval} ---") 
+                    step += 1  # increment only after optimizer step
+                    t0 = time.time()
 
-                    model_tracker.update_all(time_interval=time_interval,
-                                             curr_step=step)
-                    start_time=time.time()
-
-                print(f"step: {step:6d} | loss: {loss.item():.4f} | time: {time_diff_ms:.2f}ms | tps:{tps:.2f} | norm:{norm:.2f} | lr:{'{0:.2E}'.format(lr)}")
-
-            print("training loop finished ✔")
+                if step != 0 and step % save_interval == 0:
+                        model_tracker.update_all(time_interval=(t1 - t0), curr_step=batch_idx)
         
         except KeyboardInterrupt:
             print("\nTraining interrupted by user! Saving and plotting...")
 
         finally:
-            end_time=time.time()
-            time_interval=end_time-start_time
+            t1=time.time()
+            time_interval=t1-t0
             model_tracker.update_all(time_interval=time_interval,
-                                    curr_step=step)
+                                    curr_step=batch_idx)
+            
+    def invoke(self, 
+               max_new_tokens:int, 
+               prompt:str, 
+               device:str
+               ):
+        """
+        Prompt the model, now only supports Next Token Sampling
+        """
+        self.eval()
+        enc=self.enc
+
+        x   = torch.tensor(enc.encode(prompt), dtype=torch.long, device=device)[None, :]
+        prompt_length=x.size(1)
+        torch.manual_seed(42)
+
+        while x.size(1) < prompt_length+max_new_tokens:
+            #generation loop
+            with torch.no_grad():
+                logits, _ = self(x)
+                probs = F.softmax(logits[:, -1, :], dim=-1)
+                next_token = torch.multinomial(probs, num_samples=1)
+                x = torch.cat([x, next_token], dim=1)
+
+        return enc.decode(x[0].tolist())

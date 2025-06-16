@@ -1,9 +1,0 @@
-{
-    "Tokens Exposed": 7598866432,
-    "Steps Trained": 463798,
-    "Epochs": 0.8405825699115047,
-    "Best Loss": 5.668023109436035,
-    "Time Spent Training": 32.07749557495117,
-    "Model Path": "GPT2-exploration/models/gpt-2/gpt-2.pth",
-    "Batch Size": 16
-}

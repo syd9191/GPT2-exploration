@@ -59,9 +59,9 @@ def smoke_test(loader,
         print("\n**** DataLoader smoke-test passed ****")
 
 
-def get_lr( step:int, 
+def get_lr(step:int, 
             max_steps:int, 
-            warmup_steps:int=10,
+            warmup_steps:int=100,
             max_lr:float=3e-4):
         """
         Follows GPT-3's learning rate with a cosine decay

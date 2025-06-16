@@ -12,7 +12,10 @@ class DirStreamingDataset(IterableDataset):
     Each file is 10 million tokens, total of 904 files
     """
 
-    def __init__(self, path: Union[str, os.PathLike], block_size: int):
+    def __init__(self, 
+                 path: Union[str, os.PathLike], 
+                 block_size: int,
+                 seed:int):
         self.dir_path = Path(path)
         if not self.dir_path.exists():
             raise FileNotFoundError(path)
@@ -23,6 +26,7 @@ class DirStreamingDataset(IterableDataset):
         self.num_files=len(self.token_files)
         self.block_size = block_size
         self.num_token_per_file=10000000
+        self.seed=seed
 
         # introduce per-worker offset to avoid every worker seeing the
         # same sequence order when shuffling is disallowed.
@@ -55,6 +59,7 @@ class DirStreamingDataset(IterableDataset):
                     y = chunk[1:]
                     pos += self.block_size
                     yield x, y# DataLoader → (B,T)
+
     def __len__(self):
         # Just return an estimate or token count divided by block size
         return self.get_dataset_token_count() // self.block_size     

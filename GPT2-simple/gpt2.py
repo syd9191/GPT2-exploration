@@ -19,10 +19,20 @@ from model.model_tracker import ModelTracker
 if __name__=="__main__":
     data_path     = "./GPT2-exploration/data/openwebtext"
     model_name    = "gpt-2"
-    B, T          = 16, 1024
+    B, T          = 16, 1024 #micro batch size
     lr            = 3e-4
-    max_steps     = 50000000000
+    max_steps     = 100000000
     save_interval = 10000
+    batch_size    = 524288 #2**19 we stick with the pow 2 again
+    enc           = tiktoken.get_encoding("gpt2")
+    prompt        = "I am a large language model,"
+
+    assert batch_size%(B*T)==0 
+
+    grad_accum_steps=batch_size//(B*T)
+    save_interval=save_interval//grad_accum_steps
+    max_steps=max_steps//grad_accum_steps
+    
 
     plot_path   = f"./GPT2-exploration/analytics/{model_name}/plots/{model_name}_loss_curve.png"
     model_path  = f"./GPT2-exploration/models/{model_name}/{model_name}.pth"
@@ -33,8 +43,12 @@ if __name__=="__main__":
 
     device, use_amp_cuda = utils.get_device(verbose=True)
 
-    dataset = DirStreamingDataset(path=data_path, block_size=T)
-
+    dataset = DirStreamingDataset(path=data_path, 
+                                  block_size=T,
+                                  seed=42)
+    val_dataset = DirStreamingDataset(path=data_path, 
+                                      block_size=T,
+                                      seed=24) #another instance for val use
 
     torch.set_float32_matmul_precision('high')
 
@@ -47,8 +61,11 @@ if __name__=="__main__":
         local_rank = int(os.environ.get("LOCAL_RANK", 0))
         torch.cuda.set_device(local_rank)
         sampler = DistributedSampler(dataset, shuffle=False)
+        val_sampler= DistributedSampler(val_dataset, shuffle=False)
+        ddp=True
     else:
         sampler = None
+        ddp=False
 
     loader = utils.make_loader(
         dataset,
@@ -58,12 +75,21 @@ if __name__=="__main__":
         device_is_cuda=device.type == "cuda",
     )
 
+    val_loader = utils.make_loader(
+        val_dataset,
+        batch_size=B,
+        num_workers=4,            # no separate workers ➜ no pickling
+        sampler=val_sampler,
+        device_is_cuda=device.type == "cuda",
+    )
+
     utils.smoke_test(B=B,
                     T=T,
                     loader=loader) #test before training
 
     model = GPT(config=GPTConfig(),
-                sampler=sampler).to(device)
+                sampler=sampler,
+                enc=enc).to(device)
     model = torch.compile(model)
 
     optimiser = model.configure_optimizers(weight_decay=0.1,
@@ -107,25 +133,21 @@ if __name__=="__main__":
                   save_interval=save_interval,
                   batch_size=B, 
                   seq_len=T, 
+                  test_prompt=prompt,
+                  grad_accum_steps=grad_accum_steps,
                   use_amp_cuda=use_amp_cuda,
+                  ddp=ddp, 
                   loader=loader, 
+                  val_loader=val_loader, 
                   model_tracker=model_tracker,
                   device=device.type,
                   scaler=scaler,
                   optimiser=optimiser)
 
-    model.eval()
-    prompt = "MARCIUS: "
-    enc = tiktoken.get_encoding("gpt2")
-    x   = torch.tensor(enc.encode(prompt), dtype=torch.long, device=device)[None, :]
-    torch.manual_seed(42)
-    while x.size(1) < 50:
-        with torch.no_grad():
-            logits, _ = model(x)
-            probs = F.softmax(logits[:, -1, :], dim=-1)
-            next_token = torch.multinomial(probs, num_samples=1)
-            x = torch.cat([x, next_token], dim=1)
-    print(enc.decode(x[0].tolist()))
+    model.module.invoke(prompt=prompt,
+                 max_new_tokens=30, 
+                 device=device, 
+                 )
 
     import  sys;sys.exit(0)
 
