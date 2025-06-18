@@ -278,6 +278,7 @@ class GPT(nn.Module):
                       save_interval:int, 
                       batch_size:int,
                       seq_len:int,
+                      max_lr:int, 
                       test_prompt:str,
                       device:str, 
                       grad_accum_steps:int,  
@@ -331,7 +332,10 @@ class GPT(nn.Module):
 
                     # Logging and tracking
                     model_tracker.add_loss(loss.item() * grad_accum_steps)
-                    lr = utils.get_lr(step=step, max_steps=max_steps)
+                    lr = utils.get_lr(step=step, 
+                                      max_steps=max_steps,
+                                      max_lr=max_lr)
+                    
                     for param_group in optimiser.param_groups:
                         param_group['lr'] = lr
 
@@ -340,11 +344,13 @@ class GPT(nn.Module):
                     tps = (batch_size * seq_len * grad_accum_steps) / (t1 - t0)
                     print(f"step: {step:6d} | loss: {loss.item() * grad_accum_steps:.4f} | tps: {tps:.2f} | dt: {t1-t0} | norm: {norm:.2f} | lr: {'{0:.2E}'.format(lr)}")
 
-                    step += 1  # increment only after optimizer step
                     t0 = time.time()
 
-                if step != 0 and step % save_interval == 0:
-                        model_tracker.update_all(time_interval=(t1 - t0), curr_step=batch_idx)
+                    if step != 0 and (step+1) % save_interval == 0:
+                        model_tracker.update_all(time_interval=(t1 - t0), 
+                                                 curr_step=batch_idx)
+                    
+                    step += 1  # increment only after optimizer step
         
         except KeyboardInterrupt:
             print("\nTraining interrupted by user! Saving and plotting...")

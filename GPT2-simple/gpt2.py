@@ -19,10 +19,10 @@ from model.model_tracker import ModelTracker
 if __name__=="__main__":
     data_path     = "./GPT2-exploration/data/openwebtext"
     model_name    = "gpt-2"
-    B, T          = 16, 1024 #micro batch size
-    lr            = 3e-4
-    max_steps     = 100000000
-    save_interval = 10000
+    B, T          = 8, 2048 #micro batch size
+    max_lr        = (6e-4)*3
+    max_steps     = 19073
+    save_interval = 300
     batch_size    = 524288 #2**19 we stick with the pow 2 again
     enc           = tiktoken.get_encoding("gpt2")
     prompt        = "I am a large language model,"
@@ -30,8 +30,7 @@ if __name__=="__main__":
     assert batch_size%(B*T)==0 
 
     grad_accum_steps=batch_size//(B*T)
-    save_interval=save_interval//grad_accum_steps
-    max_steps=max_steps//grad_accum_steps
+    
     
 
     plot_path   = f"./GPT2-exploration/analytics/{model_name}/plots/{model_name}_loss_curve.png"
@@ -93,7 +92,7 @@ if __name__=="__main__":
     model = torch.compile(model)
 
     optimiser = model.configure_optimizers(weight_decay=0.1,
-                                           learning_rate=6e-4
+                                           learning_rate=max_lr
                                            )
     
 
@@ -133,6 +132,7 @@ if __name__=="__main__":
                   save_interval=save_interval,
                   batch_size=B, 
                   seq_len=T, 
+                  max_lr=max_lr, 
                   test_prompt=prompt,
                   grad_accum_steps=grad_accum_steps,
                   use_amp_cuda=use_amp_cuda,

@@ -67,14 +67,15 @@ class ModelTracker:
     def update_all(self,
                    time_interval:float,
                    curr_step:int):
-        self.update(time_interval=time_interval,
+        if not dist.is_initialized() or (dist.is_initialized() and dist.get_rank()==0):
+            self.update(time_interval=time_interval,
                     curr_step=curr_step,
                     last_step_updated=self.last_step_updated)
-        
-        self.last_step_updated=curr_step
-        self.save_best_weights()
-        self.save_stats()
-        self.plot_loss()
+            self.save_best_weights()
+            self.save_stats()
+            self.plot_loss()
+
+            self.last_step_updated=curr_step
 
     def save_stats(self):
     # Only save from the main process (rank 0)
@@ -98,13 +99,13 @@ class ModelTracker:
         Updates Stats based on how many steps have been taken
         """
         steps=curr_step-last_step_updated
+
         self.stats["Steps Trained"] += steps
         self.stats["Epochs"] += (self.batch_size*self.seq_length*steps)/self.total_tokens
         self.stats["Tokens Exposed"] += self.batch_size*self.seq_length*steps
         self.stats["Time Spent Training"] += time_interval
         self.stats["Best Loss"] = self.best_loss
 
-        
         np.save(self.loss_path, np.array(self.losses)) #store loss in a npy file, storing in json is retarded
         
     def add_loss(self, 
@@ -120,6 +121,7 @@ class ModelTracker:
     
     def plot_loss(self, 
                   show:bool=False):
+        print("plotting loss here")
         plt.figure(figsize=(8, 5))
         plt.plot(self.losses, label="Training Loss")
         plt.xlabel("Step")
@@ -131,4 +133,5 @@ class ModelTracker:
         plt.savefig(self.plot_path, dpi=300)
         if show:
             plt.show()
+        plt.close() 
         
