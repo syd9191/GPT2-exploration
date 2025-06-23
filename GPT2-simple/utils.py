@@ -61,7 +61,7 @@ def smoke_test(loader,
 
 def get_lr(step:int, 
             max_steps:int, 
-            warmup_steps:int=100,
+            warmup_steps:int=0,
             max_lr:float=3e-4):
         """
         Follows GPT-3's learning rate with a cosine decay

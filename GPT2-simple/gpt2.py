@@ -19,9 +19,9 @@ from model.model_tracker import ModelTracker
 if __name__=="__main__":
     data_path     = "./GPT2-exploration/data/openwebtext"
     model_name    = "gpt-2"
-    B, T          = 8, 2048 #micro batch size
-    max_lr        = (6e-4)*3
-    max_steps     = 19073
+    B, T          = 16, 1024 #micro batch size
+    max_lr        = 2e-4
+    max_steps     = 7066
     save_interval = 300
     batch_size    = 524288 #2**19 we stick with the pow 2 again
     enc           = tiktoken.get_encoding("gpt2")
@@ -30,8 +30,6 @@ if __name__=="__main__":
     assert batch_size%(B*T)==0 
 
     grad_accum_steps=batch_size//(B*T)
-    
-    
 
     plot_path   = f"./GPT2-exploration/analytics/{model_name}/plots/{model_name}_loss_curve.png"
     model_path  = f"./GPT2-exploration/models/{model_name}/{model_name}.pth"

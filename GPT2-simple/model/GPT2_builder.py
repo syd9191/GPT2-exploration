@@ -274,31 +274,27 @@ class GPT(nn.Module):
 
 
     def training_loop(self,
-                      max_steps:int,
-                      save_interval:int, 
-                      batch_size:int,
-                      seq_len:int,
-                      max_lr:int, 
-                      test_prompt:str,
-                      device:str, 
-                      grad_accum_steps:int,  
-                      use_amp_cuda:bool, 
-                      ddp:bool, 
-                      loader:DataLoader, 
-                      val_loader:DataLoader, 
-                      model_tracker:ModelTracker,
-                      scaler:torch.amp.GradScaler,
-                      optimiser:torch.optim
-                      ):
-        """
-        I dont think training loop should be in the GPT2 class specifically, for convenience I put it here first 
-
-        TODO: Model Training class
-        """
+                  max_steps: int,
+                  save_interval: int, 
+                  batch_size: int,
+                  seq_len: int,
+                  max_lr: float, 
+                  test_prompt: str,
+                  device: str, 
+                  grad_accum_steps: int,
+                  use_amp_cuda: bool, 
+                  ddp: bool, 
+                  loader: DataLoader, 
+                  val_loader: DataLoader, 
+                  model_tracker: ModelTracker,
+                  scaler: torch.amp.GradScaler,
+                  optimiser: torch.optim.Optimizer,
+                  grad_accum: bool=True):
         try:
             self.train()
-            t0=time.time()
-            step=0
+            t0 = time.time()
+            step = 0
+            loss_accum = 0.0
 
             for batch_idx, (x, y) in enumerate(loader):
                 if step >= max_steps:
@@ -308,59 +304,64 @@ class GPT(nn.Module):
 
                 with torch.autocast(device_type=device, dtype=torch.bfloat16, enabled=use_amp_cuda):
                     logits, loss = self(x, y)
-                    loss = loss / grad_accum_steps
 
-                scaler.scale(loss).backward()
-
-                if (batch_idx + 1) % grad_accum_steps == 0:
-                    if step%100==0:
-                        self.val_loss(val_loader=val_loader,
-                                    device=device,
-                                    ddp=ddp,
-                                    )
-                        model_response=self.invoke(max_new_tokens=30,
-                                    prompt=test_prompt,
-                                    device=device)
-                        if not ddp or (dist.is_initialized() and dist.get_rank()==0):
-                            print(model_response)
-                        self.train()
-
-                    norm = torch.nn.utils.clip_grad_norm_(self.parameters(), 1.0)
-                    scaler.step(optimiser)
-                    scaler.update()
+                if not torch.isfinite(loss):
+                    print(f"Non-finite loss at step {step}, skipping...")
                     optimiser.zero_grad(set_to_none=True)
+                    continue
 
-                    # Logging and tracking
-                    model_tracker.add_loss(loss.item() * grad_accum_steps)
-                    lr = utils.get_lr(step=step, 
-                                      max_steps=max_steps,
-                                      max_lr=max_lr)
-                    
-                    for param_group in optimiser.param_groups:
-                        param_group['lr'] = lr
+                if grad_accum:
+                    loss = loss / grad_accum_steps
+                    loss_accum += loss.detach()
+                    scaler.scale(loss).backward()
+                    if (batch_idx + 1) % grad_accum_steps != 0:
+                        continue  # wait until full accumulation before optimizer step
+                else:
+                    loss_accum = loss.detach()
+                    scaler.scale(loss).backward()
 
-                    torch.cuda.synchronize()
-                    t1 = time.time()
-                    tps = (batch_size * seq_len * grad_accum_steps) / (t1 - t0)
-                    print(f"step: {step:6d} | loss: {loss.item() * grad_accum_steps:.4f} | tps: {tps:.2f} | dt: {t1-t0} | norm: {norm:.2f} | lr: {'{0:.2E}'.format(lr)}")
+                if step % 100 == 0:
+                    self.val_loss(val_loader=val_loader, device=device, ddp=ddp)
+                    model_response = self.invoke(max_new_tokens=30, prompt=test_prompt, device=device)
+                    if not ddp or (dist.is_initialized() and dist.get_rank() == 0):
+                        print(model_response)
+                    self.train()
 
-                    t0 = time.time()
+                scaler.unscale_(optimiser)  # Unscale before clipping
+                norm = torch.nn.utils.clip_grad_norm_(self.parameters(), 1.0)
+                scaler.step(optimiser)
+                scaler.update()
+                optimiser.zero_grad(set_to_none=True)
 
-                    if step != 0 and (step+1) % save_interval == 0:
-                        model_tracker.update_all(time_interval=(t1 - t0), 
-                                                 curr_step=batch_idx)
-                    
-                    step += 1  # increment only after optimizer step
-        
+                # Logging and tracking
+                model_tracker.add_loss(loss_accum.item())
+                lr = utils.get_lr(step=step, max_steps=max_steps, max_lr=max_lr)
+                for param_group in optimiser.param_groups:
+                    param_group['lr'] = lr
+
+                torch.cuda.synchronize()
+                t1 = time.time()
+                time_interval=t1-t0
+                tokens_per_sec = (batch_size * seq_len * (grad_accum_steps if grad_accum else 1)) / (t1 - t0)
+                print(f"step: {step:6d} | loss: {loss_accum:.4f} | tps: {tokens_per_sec:.2f} | dt: {time_interval:.2f} | norm: {norm:.2f} | lr: {'{0:.2E}'.format(lr)}")
+
+                t0 = time.time()
+                loss_accum = 0.0
+                step += 1
+
+                if step != 0 and step % save_interval == 0:
+                    model_tracker.update_all(time_interval=time_interval, curr_step=batch_idx)
+                    curr_seq = self.enc.decode(x[0].tolist())
+                    print(f"peek at data: {curr_seq}")
+
         except KeyboardInterrupt:
             print("\nTraining interrupted by user! Saving and plotting...")
 
         finally:
-            t1=time.time()
-            time_interval=t1-t0
-            model_tracker.update_all(time_interval=time_interval,
-                                    curr_step=batch_idx)
-            
+            t1 = time.time()
+            model_tracker.update_all(time_interval=(t1 - t0), curr_step=batch_idx)
+
+                
     def invoke(self, 
                max_new_tokens:int, 
                prompt:str, 
