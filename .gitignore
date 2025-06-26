@@ -1,3 +1,5 @@
 venv/
 models/
-data/
+data/openwebtext
+data/smol-smoltalk
+data/input.txt
