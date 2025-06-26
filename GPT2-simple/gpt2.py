@@ -1,538 +1,180 @@
-import os, random
-import time
+import os
 from pathlib import Path
-from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import IterableDataset, DataLoader, DistributedSampler
-import matplotlib.pyplot as plt
+from torch.utils.data import DistributedSampler
 import tiktoken
-import json
-import numpy as np
+
 
 #custom
 import utils
-
-#---------------------------------------------------------
-@dataclass
-class GPTConfig:
-    block_size:int=1024
-    vocab_size:int=50257
-    n_layer:int=12
-    n_head:int=12
-    n_embd:int=768
-
-class TokenTextDataset(IterableDataset):
-    """
-    Streams the entire file token-by-token forever, returning sa contiguous
-    sliding window of `block_size` for x and the next-token labels for y.
-    """
-
-    def __init__(self, path: str | os.PathLike, block_size: int):
-        path = Path(path)
-        if not path.exists():
-            raise FileNotFoundError(path)
-
-        text      = path.read_text(encoding="utf-8")
-        enc       = tiktoken.get_encoding("gpt2")
-        self.tokens = torch.tensor(enc.encode(text), dtype=torch.long)
-        self.block_size = block_size
-
-        # introduce per-worker offset to avoid every worker seeing the
-        # same sequence order when shuffling is disallowed.
-        # DataLoader(worker_init_fn) will set this value.
-        self._worker_offset = 0
-
-    # DataLoader with an IterableDataset must NOT shuffle. We instead start each worker at a random offset to approximate randomness.
-    def set_worker_offset(self, offset: int):
-        self._worker_offset = offset
-
-    def get_dataset_token_count(self):
-        return len(self.tokens)
-
-    def __iter__(self):
-        n   = len(self.tokens)
-        pos = self._worker_offset % n
-        rng = torch.Generator().manual_seed(torch.randint(0, 2**31 - 1, (1,)).item())
-
-        while True:
-            # wrap & optionally jump to a new random start to decorrelate batches
-            if pos + self.block_size + 1 >= n:
-                pos = torch.randint(0, n - self.block_size - 2, (1,), generator=rng).item()
-
-            chunk  = self.tokens[pos : pos + self.block_size + 1]           # (T+1,)
-            x      = chunk[:-1]                                             # (T,)
-            y      = chunk[ 1:]                                             # (T,)
-            pos   += self.block_size
-            yield x, y                                                      # DataLoader → (B,T)
-
-
-class DataLoaderLite():
-    def __init__(self, B, T, device):
-        self.device=device
-        self.B=B
-        self.T=T
-        with open('../exploration/input.txt', 'r') as f:
-            text=f.read()
-        enc=tiktoken.get_encoding('gpt2')
-        tokens=enc.encode(text)
-        self.tokens=torch.tensor(tokens)
-        print(f"Loaded {len(self.tokens)} Tokens")
-        print(f"1 Epoch = {len(self.tokens)//(B*T)} Batches")
-        self.current_pos=0
-
-    def get_next_batch(self):
-        B=self.B
-        T=self.T
-        buf=self.tokens[self.current_pos: self.current_pos+(B*T)+1] #similar batching that we tested
-        x=buf[:-1].view(B, T).to(self.device) #should follow a B batches of T sequences kind of format
-        y=buf[1:].view(B, T).to(self.device)
-        self.current_pos+=B*T
-        if self.current_pos + (B*T+1)>=len(self.tokens): #we have already reached the end of our training dataset
-            self.current_pos=0
-        return x, y
-        
-
-
-class CausalSelfAttention(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        assert config.n_embd % config.n_head==0 
-        self.c_attn=nn.Linear(config.n_embd, 3*config.n_embd) #for the k,q,v
-
-        self.c_proj=nn.Linear(config.n_embd, config.n_embd) 
-        self.c_proj.NANOGPT_SCALE_INIT = 1 #this is a flag for scaling down weights, following xaviers initialisation
-        self.n_head=config.n_head
-        self.n_embd=config.n_embd
-
-    def forward(self, x):
-        B, T, C= x.size() #batch size, sequence length, embedding dimentionality
-        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        # nh is "number of heads", hs is "head size", and C (number of channels) = nh * hs
-        # e.g. in GPT-2 (124M), n_head=12, hs=64, so nh*hs=C=768 channels in the Transformer
-        qkv=self.c_attn(x) # x.shape = [batch, seq_len, n_embd] = [B, T, 768] - > [batch, seq_len, 3*n_embd] -> [B, T, 3*768] 
-
-        """
-        i was quite confused on how it was split, but apparently for each qkv token, the q, k, and v values are just concatenated, so when we call qkv.split(n_embd) on the last feature, we get the q, k and v 
-        qkv[0, 0] = [q₀ q₁ q₂ q₃ q₄ q₅ q₆ q₇  |  k₀ k₁ k₂ k₃ k₄ k₅ k₆ k₇  |  v₀ v₁ v₂ v₃ v₄ v₅ v₆ v₇]
-              <------ Q ------->       <------ K ------->       <------ V ------->
-        """
-        q, k, v=qkv.split(self.n_embd, dim=2) #[B, T, 768] again
-
-        #here we split each KQV tensor into number of heads for simulatneous processing, we force a new tensor shape while keeping the same data so we can calc attention down the road
-    
-        k=k.contiguous().view(B,T,self.n_head,C//self.n_head).transpose(1,2) #final output dimension [B,n_head,T,hs]
-        q=q.contiguous().view(B,T,self.n_head,C//self.n_head).transpose(1,2) #final output dimension [B,n_head,T,hs]
-        v=v.contiguous().view(B,T,self.n_head,C//self.n_head).transpose(1,2) #final output dimension [B,n_head,T,hs]
-
-        y=F.scaled_dot_product_attention(q,k,v, is_causal=True) #normal dot prod calculation of attention, this one might use flash_attn not very sure
-        y=y.transpose(1,2).contiguous().view(B,T,C) #reassembles the heads back to the original dimensions
-        
-        y=self.c_proj(y)
-        return y
-
-
-class MLP(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.c_fc=nn.Linear(config.n_embd, 4*config.n_embd)
-        self.gelu=nn.GELU(approximate='tanh') #GELU: Gausian Error Linear Unit, is what they came up with to deal with the dead neuron problem that comes with RELU, read more here: http://arxiv.org/pdf/1606.08415v5
-        self.c_proj=nn.Linear(4*config.n_embd, config.n_embd)
-        self.c_proj.NANOGPT_SCALE_INIT = 1
-
-    def forward(self, x):
-        x=self.c_fc(x) ##pass through the fully connect
-        x=self.gelu(x)
-        x=self.c_proj(x)
-        return x
-
-class Block(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.ln_1=nn.LayerNorm(config.n_embd)
-        self.attn=CausalSelfAttention(config)
-        self.ln_2=nn.LayerNorm(config.n_embd)
-        self.mlp=MLP(config)
-
-    def forward(self, x): #feedforward process similar to attention is all you need
-        x= x + self.attn(self.ln_1(x)) #add residual connection, originating from RESNET 50 actually
-        x= x + self.mlp(self.ln_2(x))  #add residual connection
-        return x
-
-class GPT(nn.Module):
-    def __init__(self, config): 
-        super().__init__()
-        self.config=config
-        self.transformer=nn.ModuleDict(dict(
-            wte=nn.Embedding(config.vocab_size, config.n_embd),
-            wpe=nn.Embedding(config.block_size, config.n_embd),
-            h=nn.ModuleList([Block(config) for _ in range(config.n_layer)]), #h is the number of heads
-            ln_f=nn.LayerNorm(config.n_embd), #layer norm
-        ))
-        self.lm_head=nn.Linear(config.n_embd, config.vocab_size, bias=False)
-
-        #weight sharing: This concept is expanded on the google docs: https://docs.google.com/document/d/1cRYtDPcxogKBLilWpaeLZIxQlXp04IAZwKnCuk3GhUU/edit?tab=t.0
-        self.transformer.wte.weight=self.lm_head.weight
-
-        self.apply(self._init_weights)
-
-    def _init_weights(self, module):
-        if isinstance(module, nn.Linear):
-            std=0.02
-            if hasattr(module, 'NANOGPT_SCALE_INIT'):
-                std*= (2*self.config.n_layer)**-0.5 #2 cause there are two residual connections for each block i guess
-            torch.nn.init.normal_(module.weight, mean=0, std=std)
-            if module.bias is not None:
-                torch.nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.Embedding):
-            torch.nn.init.normal_(module.weight, mean=0, std=0.02)
-    
-    
-    def forward(self, idx, targets=None):
-        B, T=idx.size() #Batch , Sequence length
-        assert T<=self.config.block_size, f"Cannot forward sequence of length: {T}, with a block size of only {self.config.block_size}"
-        pos=torch.arange(0,T,dtype=torch.long,device=idx.device) #this is just a tensor shape [T]
-        pos_emb=self.transformer.wpe(pos)
-        tok_embd=self.transformer.wte(idx) #this should produce something like [B, T, n_embd], for each token in the sequence, it should make it into a 768 dimension vector embedding
-        x=pos_emb+tok_embd
-        
-        for block in self.transformer.h:
-            x=block(x) #forward across all transformer blocks
-
-        x=self.transformer.ln_f(x)
-        logits=self.lm_head(x) #(B,T,vocab_size) for each token, this is the confidence score for each word in the vocab being the next token, pre softmax
-        loss=None
-        if targets is not None:
-            loss=F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
-        return logits,loss
-
-    @classmethod
-    def from_pretrained(cls, model_type):
-        """ HONESTLY NOT GOING TO SPEND THE TIME TO UNDERSTAND PARAM LOADING
-        """
-        assert model_type in {'gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'}
-        from transformers import GPT2LMHeadModel
-        print("loading weights from pretrained gpt: %s" % model_type)
-
-        # n_layer, n_head and n_embd are determined from model_type
-        config_args = {
-            'gpt2':         dict(n_layer=12, n_head=12, n_embd=768),  # 124M params
-            'gpt2-medium':  dict(n_layer=24, n_head=16, n_embd=1024), # 350M params
-            'gpt2-large':   dict(n_layer=36, n_head=20, n_embd=1280), # 774M params
-            'gpt2-xl':      dict(n_layer=48, n_head=25, n_embd=1600), # 1558M params
-        }[model_type]
-        config_args['vocab_size'] = 50257 # always 50257 for GPT model checkpoints
-        config_args['block_size'] = 1024 # always 1024 for GPT model checkpoints
-        # create a from-scratch initialized minGPT model
-        config = GPTConfig(**config_args)
-        model = GPT(config)
-        sd = model.state_dict()
-        sd_keys = sd.keys()
-        sd_keys = [k for k in sd_keys if not k.endswith('.attn.bias')] # discard this mask / buffer, not a param
-
-        # init a huggingface/transformers model
-        model_hf = GPT2LMHeadModel.from_pretrained(model_type)
-        sd_hf = model_hf.state_dict()
-
-        # copy while ensuring all of the parameters are aligned and match in names and shapes
-        sd_keys_hf = sd_hf.keys()
-        sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.masked_bias')] # ignore these, just a buffer
-        sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.bias')] # same, just the mask (buffer)
-        transposed = ['attn.c_attn.weight', 'attn.c_proj.weight', 'mlp.c_fc.weight', 'mlp.c_proj.weight']
-        # basically the openai checkpoints use a "Conv1D" module, but we only want to use a vanilla Linear
-        # this means that we have to transpose these weights when we import them
-        assert len(sd_keys_hf) == len(sd_keys), f"mismatched keys: {len(sd_keys_hf)} != {len(sd_keys)}"
-        for k in sd_keys_hf:
-            if any(k.endswith(w) for w in transposed):
-                # special treatment for the Conv1D weights we need to transpose
-                assert sd_hf[k].shape[::-1] == sd[k].shape
-                with torch.no_grad():
-                    sd[k].copy_(sd_hf[k].t())
-            else:
-                # vanilla copy over the other parameters
-                assert sd_hf[k].shape == sd[k].shape
-                with torch.no_grad():
-                    sd[k].copy_(sd_hf[k])
-
-        return model
-    
-    def load_weights(self,
-                    path:str,
-                    device:str="cpu",
-                    strict:bool=True):
-        
-        if not os.path.exists(path):
-            raise FileNotFoundError(f"The file path: {path} does not exist")
-        state_dict=torch.load(path, map_location=device)
-        self.load_state_dict(state_dict,strict=strict)
-        print(f"Model weights loaded from {path}")
-    
-
-    def training_loop(self,
-                      max_steps:int,
-                      loader:DataLoader, 
-                      device:str, 
-                      scaler:torch.amp.GradScaler,
-                      optimiser:torch.optim
-                      ):
-        try:
-            start_time=time.time()
-
-            for step, (x, y) in enumerate(loader):
-                if step >= max_steps:
-                    break
-
-                x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
-
-                optimiser.zero_grad(set_to_none=True)
-
-                with torch.amp.autocast(device.type, enabled=use_amp_cuda):
-                    logits, loss = model(x, y)
-
-                model_tracker.add_loss(loss.item())
-
-                scaler.scale(loss).backward()
-                scaler.step(optimiser)
-                scaler.update()
-
-                if sampler is not None:
-                    sampler.set_epoch(step)  # shuffle shards every epoch
-
-                if step%epoch_size==0 and step//epoch_size!=0: #we have reached one epoch
-                    end_time=time.time()
-                    time_interval=end_time-start_time
-                    print(f"--- Epoch {step//epoch_size} Reached ---") 
-                    print(f"--- Time Taken: {time_interval} ---") 
-                    model_tracker.update_all(time_interval=time_interval,
-                                             curr_loss=loss.item())
-                    start_time=time.time()
-                print(f"step {step:6d}  loss {loss.item():.4f}")
-
-            print("training loop finished ✔")
-        
-        except KeyboardInterrupt:
-            print("\nTraining interrupted by user! Saving and plotting...")
-
-        finally:
-            end_time=time.time()
-            time_interval=end_time-start_time
-            model_tracker.update_all(time_interval=time_interval,
-                                             curr_loss=loss.item())
-
-class ModelTracker:
-    def __init__(self, 
-                model:torch.nn.Module,
-                batch_size:int, 
-                seq_length:int, 
-                total_tokens:int, 
-                plot_path:str, 
-                model_path:str,
-                stats_path:str,
-                loss_path:str):
-        
-        self.losses:list=[]
-        self.batch_size=batch_size
-        self.seq_length=seq_length
-        self.total_tokens=total_tokens
-        self.best_loss:float=float('inf')
-        self.plot_path:Path=Path(plot_path)
-        self.model_path:Path=Path(model_path)
-        self.stats_path:Path=Path(stats_path)
-        self.loss_path:Path=Path(loss_path)
-        self.best_weights=None
-        self.model=model
-        self.stats={"Tokens Exposed": 0,
-                    "Steps Trained": 0,
-                    "Epochs": 0,
-                    "Best Loss": float('inf'),
-                    "Time Spent Training":0,
-                    "Model Path":str(self.model_path),
-                    "Batch Size": self.batch_size,
-                    }
-        
-        self._load()
-
-    def _load(self):
-        if os.path.exists(self.stats_path):
-            with open(self.stats_path, "r") as f:
-                self.stats.update(json.load(f))
-        
-        if self.loss_path.exists():
-            self.losses = np.load(self.loss_path).tolist()
-
-    def update_all(self,
-                   time_interval:float,
-                   curr_loss:float):
-        self.update(time_interval=time_interval,
-                    curr_loss=curr_loss)
-        self.save_best_weights()
-        self.save_stats()
-        self.plot_loss()
-
-    def save_stats(self):
-        self.stats_path.parent.mkdir(parents=True, exist_ok=True)
-        
-        try:
-            with open(self.stats_path, "w") as f:
-                json.dump(self.stats, f, indent=4)
-
-        except Exception as e:
-            raise ValueError(f"Json object cannot be saved: {e}")
-    
-    def update(self,
-           time_interval:float,
-           curr_loss:float):
-        
-        self.stats["Epochs"] += 1
-        self.stats["Tokens Exposed"] += self.total_tokens
-        self.stats["Time Spent Training"] += time_interval
-        self.stats["Steps Trained"] += self.total_tokens // (self.batch_size * self.seq_length)
-        self.stats["Best Loss"] = self.best_loss
-        
-        np.save(self.loss_path, np.array(self.losses)) #store loss in a npy file, storing in json is retarded
-        
-    def add_loss(self, 
-                 loss:float):
-        self.losses.append(loss)
-        if loss<self.best_loss and self.model is not None:
-            self.best_loss=loss
-            self.best_weights=self.model.state_dict()
-
-    def save_best_weights(self):
-        if self.best_weights is not None:
-            torch.save(self.best_weights, self.model_path)
-    
-    def plot_loss(self, 
-                  show:bool=False):
-        plt.figure(figsize=(8, 5))
-        plt.plot(self.losses, label="Training Loss")
-        plt.xlabel("Step")
-        plt.ylabel("Loss")
-        plt.title("Training Loss Curve")
-        plt.grid(True)
-        plt.legend()
-        plt.tight_layout()
-        plt.savefig(self.plot_path, dpi=300)
-        if show:
-            plt.show()
-        
-
-def make_loader(dataset: TokenTextDataset, batch_size: int, num_workers: int,
-                sampler: DistributedSampler | None, device_is_cuda: bool):
-    def worker_init_fn(worker_id: int):
-        worker_info = torch.utils.data.get_worker_info()
-        dataset: TokenTextDataset = worker_info.dataset
-        offset = random.randint(0, len(dataset.tokens) - 1)
-        dataset.set_worker_offset(offset)
-
-    return DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        sampler=sampler,
-        num_workers=num_workers,
-        pin_memory=device_is_cuda,
-        prefetch_factor=(2 if num_workers > 0 else None), # does not run when 0 num_workers
-        persistent_workers=(num_workers > 0),
-        worker_init_fn=worker_init_fn if num_workers > 0 else None,
-    )
+from dataloaders.dir_streaming_dataset import DirStreamingDataset
+from model.GPT2_builder import GPT
+from config import GPTConfig
+from model.model_tracker import ModelTracker
 
 # ---------------- sampling loop, we could probably abstract this later on 
 if __name__=="__main__":
-    data_path   = "./data/input.txt"
-    model_name  = "gpt-2-tinyshakespeare"
-    B, T        = 4, 32
-    lr          = 3e-4
-    max_steps   = 100000
+    data_path     = "./GPT2-exploration/data/smol_smoltalk"
+    model_name    = "gpt-2"
+    B, T          = 16, 1024 #micro batch size
+    max_lr        = 6e-4
+    max_steps     = 100
+    save_interval = 25
+    batch_size    = 524288 #2**19 we stick with the pow 2 again
+    enc           = tiktoken.get_encoding("gpt2")
+    prompt        = "Describe the colour yellow?</s>"
+    mode          = "eval"
 
-    plot_path   = f"./analytics/plots/{model_name}_loss_curve.png"
-    model_path  = f"./models/{model_name}.pth"
-    stats_path  = f"./analytics/stats/{model_name}_training_stats.json"
-    loss_path   = f"./analytics/stats/{model_name}.npy"
-    
+    assert batch_size%(B*T)==0 
 
+    grad_accum_steps=batch_size//(B*T)
+
+    plot_path   = f"./GPT2-exploration/analytics/{model_name}/plots/{model_name}_finetuning_loss_curve.png"
+    model_path  = f"./GPT2-exploration/models/{model_name}/{model_name}.pth"
+    stats_path  = f"./GPT2-exploration/analytics/{model_name}/stats/{model_name}_training_stats.json"
+    loss_path   = f"./GPT2-exploration/analytics/{model_name}/stats/{model_name}_finetuning.npy"
 
     device, use_amp_cuda = utils.get_device(verbose=True)
 
-    dataset = TokenTextDataset(path=data_path, block_size=T)
-    n_tokens= dataset.get_dataset_token_count()
-    epoch_size= int(n_tokens/(B*T))
-    print(f"epoch_size: {epoch_size}")
+    if mode=="train":
+        dir_path=Path(data_path)
 
-    if torch.cuda.device_count() > 1:
-        torch.distributed.init_process_group(backend="nccl", init_method="env://")
-        local_rank = int(os.environ.get("LOCAL_RANK", 0))
-        torch.cuda.set_device(local_rank)
-        sampler = DistributedSampler(dataset, shuffle=False)
-    else:
-        sampler = None
+        
 
-    loader = make_loader(
-        dataset,
-        batch_size=B,
-        num_workers=0,            # no separate workers ➜ no pickling
-        sampler=sampler,
-        device_is_cuda=device.type == "cuda",
-    )
+        dataset = DirStreamingDataset(path=data_path, 
+                                    block_size=T,
+                                    seed=42)
+        val_dataset = DirStreamingDataset(path=data_path, 
+                                        block_size=T,
+                                        seed=24) #another instance for val use
 
-    utils.smoke_test(B=B,
-                    T=T,
-                    loader=loader) #test before training
+        torch.set_float32_matmul_precision('high')
 
-    model = GPT(GPTConfig()).to(device)
-    try:
-        print(f"Loading weights from: {model_path}")
-        model.load_weights(model_path)
-    except:
-        print(f"No pre-trained weights found at {model_path}. Starting from scratch.")
-        pass
-    
+        n_tokens= dataset.get_dataset_token_count()
+        epoch_size= int(n_tokens/(B*T))
+        print(f"epoch_size: {epoch_size}")
 
-    if torch.cuda.device_count() > 1:
-        model = nn.parallel.DistributedDataParallel(
-            model, device_ids=[torch.cuda.current_device()], output_device=torch.cuda.current_device()
-        ) # sync gradients
+        if torch.cuda.device_count() > 1:
+            torch.distributed.init_process_group(backend="nccl", init_method="env://")
+            local_rank = int(os.environ.get("LOCAL_RANK", 0))
+            torch.cuda.set_device(local_rank)
+            sampler = DistributedSampler(dataset, shuffle=False)
+            val_sampler= DistributedSampler(val_dataset, shuffle=False)
+            ddp=True
+        else:
+            sampler = None
+            ddp=False
 
-    optimiser = torch.optim.AdamW(model.parameters(), lr=lr)
-    scaler_device   = "cuda" if device.type == "cuda" else "cpu"
-    use_device_amp  = device.type == "cuda"               # enable only on CUDA
-    scaler          = torch.amp.GradScaler(scaler_device,
-                                     enabled=use_device_amp)
+        loader = utils.make_loader(
+            dataset,
+            batch_size=B,
+            num_workers=4,            # no separate workers ➜ no pickling
+            sampler=sampler,
+            device_is_cuda=device.type == "cuda",
+        )
 
-    model.train()
+        val_loader = utils.make_loader(
+            val_dataset,
+            batch_size=B,
+            num_workers=4,            # no separate workers ➜ no pickling
+            sampler=val_sampler,
+            device_is_cuda=device.type == "cuda",
+        )
 
-    model_tracker=ModelTracker(model=model,
-                            batch_size=B,
-                            seq_length=T,
-                            total_tokens=n_tokens,
-                            plot_path=plot_path,
-                            model_path=model_path,
-                            stats_path=stats_path,
-                            loss_path=loss_path )
-    
+        utils.smoke_test(B=B,
+                        T=T,
+                        loader=loader) #test before training
 
-    model.training_loop(max_steps=max_steps,
-                  loader=loader, 
-                  device=device,
-                  scaler=scaler,
-                  optimiser=optimiser)
+        model = GPT(config=GPTConfig(),
+                    sampler=sampler,
+                    enc=enc).to(device)
+        model = torch.compile(model)
 
-    model.eval()
-    prompt = "MARCIUS: "
-    enc = tiktoken.get_encoding("gpt2")
-    x   = torch.tensor(enc.encode(prompt), dtype=torch.long, device=device)[None, :]
-    torch.manual_seed(42)
-    while x.size(1) < 50:
-        with torch.no_grad():
-            logits, _ = model(x)
-            probs = F.softmax(logits[:, -1, :], dim=-1)
-            next_token = torch.multinomial(probs, num_samples=1)
-            x = torch.cat([x, next_token], dim=1)
-    print(enc.decode(x[0].tolist()))
+        optimiser = model.configure_optimizers(weight_decay=0.1,
+                                            learning_rate=max_lr
+                                            )
+        
 
-    import  sys;sys.exit(0)
+        try:
+            print(f"Loading weights from: {model_path}")
+            model.load_weights(path=model_path,
+                            device=device,
+                            weights_only=True)
+        except Exception as e:
+            print(f"No pre-trained weights found at {model_path}. Starting from scratch.")
+            print(f"Error: {e}")
+        
+
+        if torch.cuda.device_count() > 1:
+            model = nn.parallel.DistributedDataParallel(
+                model, device_ids=[torch.cuda.current_device()], output_device=torch.cuda.current_device()
+            ) # sync gradients
+
+        scaler_device   = "cuda" if device.type == "cuda" else "cpu"
+        use_device_amp  = device.type == "cuda"               # enable only on CUDA
+        scaler          = torch.amp.GradScaler(scaler_device,
+                                        enabled=use_device_amp)
+
+        model.train()
+
+        model_tracker=ModelTracker(model=model,
+                                batch_size=B,
+                                seq_length=T,
+                                total_tokens=n_tokens,
+                                plot_path=plot_path,
+                                model_path=model_path,
+                                stats_path=stats_path,
+                                loss_path=loss_path )
+        
+
+        model.module.training_loop(max_steps=max_steps,
+                    save_interval=save_interval,
+                    batch_size=B, 
+                    seq_len=T, 
+                    max_lr=max_lr, 
+                    test_prompt=prompt,
+                    grad_accum_steps=grad_accum_steps,
+                    use_amp_cuda=use_amp_cuda,
+                    ddp=ddp, 
+                    loader=loader, 
+                    val_loader=val_loader, 
+                    model_tracker=model_tracker,
+                    device=device.type,
+                    scaler=scaler,
+                    optimiser=optimiser)
+
+        model.module.invoke(prompt=prompt,
+                    max_new_tokens=30, 
+                    device=device, 
+                    )
+
+        import  sys;sys.exit(0)
+
+    elif mode=="eval":
+        model = GPT(config=GPTConfig(),
+                    sampler=None,
+                    enc=enc).to(device)
+        model = torch.compile(model)
+
+        try:
+            print(f"Loading weights from: {model_path}")
+            model.load_weights(path=model_path,
+                            device=device,
+                            weights_only=True)
+        except Exception as e:
+            print(f"No pre-trained weights found at {model_path}. Starting from scratch.")
+            print(f"Error: {e}")
+
+        response=model.invoke(prompt=prompt,
+                    max_new_tokens=300, 
+                    device=device, 
+                    )
+        
+        print(response)
+        
 
     """
     #use this code if we wanna hack generation loop
