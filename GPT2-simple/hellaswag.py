@@ -126,7 +126,7 @@ def evaluate(model_type, device):
         model = GPT(config=GPTConfig(),
                 sampler=None,
                 enc=enc).to(device)
-        model.load_weights(path="/home/sydney_sim/GPT2-exploration/models/gpt-2/gpt-2.pth",
+        model.load_weights(path="./models/gpt-2/gpt-2.pth",
                     device=device,
                     weights_only=True)
     else:
@@ -183,6 +183,6 @@ if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("-m", "--model_type", type=str, default="self_train", help="the model type to use")
-    parser.add_argument("-d", "--device", type=str, default="cuda", help="the device to use")
+    parser.add_argument("-d", "--device", type=str, default="mps", help="the device to use")
     args = parser.parse_args()
     evaluate(args.model_type, args.device)
