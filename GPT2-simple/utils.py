@@ -1,12 +1,18 @@
 import torch 
 import math 
 import random
+import os
 
 from typing import Tuple, Union
 from dataloaders.dir_streaming_dataset import DirStreamingDataset
 from torch.utils.data import DataLoader, DistributedSampler
+import torch.nn as nn
+from model.GPT2_builder import GPT, GPTConfig
+from transformers import GPT2LMHeadModel
+import tiktoken
 
 
+enc = tiktoken.get_encoding("gpt2")
 
 def get_device(verbose:bool=True)->Tuple[torch.device, bool]:
     if torch.cuda.is_available():
@@ -105,3 +111,37 @@ def make_loader(dataset: DirStreamingDataset, batch_size: int, num_workers: int,
         persistent_workers=(num_workers > 0),
         worker_init_fn=worker_init_fn if num_workers > 0 else None,
     )
+
+def quantize_model(model: torch.nn.Module) -> torch.nn.Module:
+    """
+    Dynamic quantization of all linear layers only, leaves all other layers like LayerNorm and Embeddings in f32
+    """
+    return torch.quantization.quantize_dynamic(model, {nn.Linear}, dtype=torch.qint8)
+
+def load_model(model_type, device, quantize_model_flag):
+    torch.set_float32_matmul_precision('high') # use tf32
+    
+    if model_type=="self_train":
+        model_path = "../models/gpt-2/gpt-2.pth"
+        model = GPT(config=GPTConfig(),
+                sampler=None,
+                enc=enc).to(device)
+        model.load_weights(path=model_path,
+                    device=device,
+                weights_only=True)
+
+        if quantize_model_flag == True:
+            model = quantize_model(model)
+            quant_path = "../models/gpt-2/gpt-2-quantized.pth"
+            torch.save(model.state_dict(), quant_path)
+            print(f"Saved quantized model to {quant_path}")
+
+            size_fp32 = os.path.getsize(model_path) / 1e6
+            size_q = os.path.getsize(quant_path) / 1e6
+            print(f"FP32 model: {size_fp32:.2f} MB")
+            print(f"Quantized model: {size_q:.2f} MB → {(size_q/size_fp32 * 100):.1f}% of original\n")
+    else:
+        model = GPT2LMHeadModel.from_pretrained(model_type)
+        model.to(device)
+    # model = torch.compile(model) # optionally torch compile the model
+    return model
