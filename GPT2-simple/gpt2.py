@@ -32,10 +32,10 @@ if __name__=="__main__":
 
     grad_accum_steps=batch_size//(B*T)
 
-    plot_path   = f"./GPT2-exploration/analytics/{model_name}/plots/{model_name}_finetuning_loss_curve.png"
-    model_path  = f"./GPT2-exploration/models/{model_name}/{model_name}.pth"
-    stats_path  = f"./GPT2-exploration/analytics/{model_name}/stats/{model_name}_training_stats.json"
-    loss_path   = f"./GPT2-exploration/analytics/{model_name}/stats/{model_name}_finetuning.npy"
+    plot_path   = f"../analytics/{model_name}/plots/{model_name}_finetuning_loss_curve.png"
+    model_path  = f"../models/{model_name}/{model_name}.pth"
+    stats_path  = f"../analytics/{model_name}/stats/{model_name}_training_stats.json"
+    loss_path   = f"../analytics/{model_name}/stats/{model_name}_finetuning.npy"
 
     device, use_amp_cuda = utils.get_device(verbose=True)
 

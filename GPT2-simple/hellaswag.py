@@ -29,12 +29,11 @@ import os
 import json
 import requests
 import tiktoken
-from model.GPT2_builder import GPT, GPTConfig
 from tqdm import tqdm
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
-from transformers import GPT2LMHeadModel
+from utils import load_model
 
 
 # -----------------------------------------------------------------------------
@@ -120,25 +119,12 @@ def iterate_examples(split):
             yield example
 
 @torch.no_grad()
-def evaluate(model_type, device):
-    torch.set_float32_matmul_precision('high') # use tf32
-    if model_type=="self_train":
-        model = GPT(config=GPTConfig(),
-                sampler=None,
-                enc=enc).to(device)
-        model.load_weights(path="./models/gpt-2/gpt-2.pth",
-                    device=device,
-                    weights_only=True)
-    else:
-        model = GPT2LMHeadModel.from_pretrained(model_type)
-        model.to(device)
-    # model = torch.compile(model) # optionally torch compile the model
-
-
-
+def evaluate(model, device):
     num_correct_norm = 0
     num_correct = 0
     num_total = 0
+
+    print(f"Starting Evaluation On The Following Model:\n{model}\n\n")
     for example in iterate_examples("val"):
         data, tokens, mask, label = render_example(example)
         tokens = tokens.to(device)
@@ -183,6 +169,8 @@ if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("-m", "--model_type", type=str, default="self_train", help="the model type to use")
-    parser.add_argument("-d", "--device", type=str, default="mps", help="the device to use")
+    parser.add_argument("-d", "--device", type=str, default="cpu", help="the device to use")
+    parser.add_argument("-q", "--quantize_model_flag", type=bool, default=False, help="quantize the model")
     args = parser.parse_args()
-    evaluate(args.model_type, args.device)
+    model = load_model(args.model_type, args.device, args.quantize_model_flag)
+    evaluate(model, args.device)
